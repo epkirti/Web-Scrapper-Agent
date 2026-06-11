@@ -46,6 +46,7 @@ with st.sidebar:
         chunk_overlap = st.number_input("Chunk overlap", 0, 500, 100, step=25)
         top_k = st.number_input("Chunks retrieved (top-k)", 1, 20, 5)
         page_timeout_ms = st.number_input("Page load timeout (ms)", 3000, 60000, 15000, step=1000)
+        pdf_max_pages = st.number_input("Max PDF pages to read", 5, 500, 50, step=5)
 
     st.divider()
     st.caption("Pipeline: search → scrape → parse → chunk → embed → FAISS → retrieve → answer")
@@ -77,6 +78,7 @@ if run:
         chunk_overlap=int(chunk_overlap),
         top_k=int(top_k),
         page_timeout_ms=int(page_timeout_ms),
+        pdf_max_pages=int(pdf_max_pages),
     )
 
     embedding_model = get_embedding_model(config.embedding_model_name)

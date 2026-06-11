@@ -10,5 +10,7 @@ sentence-transformers
 faiss-cpu
 langchain-text-splitters
 groq
+pypdf
+httpx
 numpy<2
 transformers<5

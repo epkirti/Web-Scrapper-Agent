@@ -10,13 +10,16 @@ Pipeline (LangGraph):
 
 from __future__ import annotations
 
+import io
 import time
 import queue
 import asyncio
 import threading
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 from typing import Callable, Iterator, Optional, Tuple, TypedDict
 
+import httpx
 import numpy as np
 import faiss
 from ddgs import DDGS
@@ -43,6 +46,8 @@ class ScraperConfig:
     chunk_overlap: int = 100
     top_k: int = 5
     page_timeout_ms: int = 15000
+    pdf_max_pages: int = 50          # cap pages read per PDF (keeps embedding fast)
+    pdf_max_chars: int = 400_000     # hard cap on extracted text per PDF
 
 
 class State(TypedDict, total=False):
@@ -50,6 +55,7 @@ class State(TypedDict, total=False):
     original_query: str
     urls: list
     html_pages: list
+    pdf_docs: list
     documents: list
     chunks: list
     embeddings: list
@@ -63,7 +69,7 @@ class State(TypedDict, total=False):
 # Friendly labels for each graph node, surfaced as progress in the UI.
 STEP_LABELS = {
     "search": "🔍 Searching the web",
-    "playwright": "🌐 Scraping pages",
+    "playwright": "🌐 Scraping pages (HTML + PDFs)",
     "parse": "📄 Extracting text",
     "chunk": "✂️ Chunking documents",
     "embed": "🧮 Computing embeddings",
@@ -121,14 +127,60 @@ class ResearchAgent:
         ]
         return state
 
+    @staticmethod
+    def _is_pdf_url(url: str) -> bool:
+        return urlsplit(url).path.lower().endswith(".pdf")
+
+    def _pdf_bytes_to_text(self, data: bytes) -> str:
+        """Extract text from PDF bytes, capped by config to keep things fast."""
+        try:
+            from pypdf import PdfReader
+        except ImportError as exc:  # surfaced clearly instead of a cryptic failure
+            raise ImportError("Reading PDFs requires 'pypdf' (pip install pypdf).") from exc
+
+        reader = PdfReader(io.BytesIO(data))
+        parts, total = [], 0
+        for page in reader.pages[: self.config.pdf_max_pages]:
+            try:
+                text = page.extract_text() or ""
+            except Exception:
+                continue
+            parts.append(text)
+            total += len(text)
+            if total >= self.config.pdf_max_chars:
+                break
+        return "\n".join(parts)
+
+    async def _fetch_pdf_text(self, http: httpx.AsyncClient, url: str) -> str:
+        try:
+            resp = await http.get(url)
+            resp.raise_for_status()
+            data = resp.content
+            if not data[:5].startswith(b"%PDF"):  # not actually a PDF
+                return ""
+            return self._pdf_bytes_to_text(data)
+        except Exception:
+            return ""
+
     async def playwright_node(self, state: State) -> State:
-        html_pages = []
+        html_pages: list = []
+        pdf_docs: list = []
         urls = state.get("urls") or []
         if urls:
-            async with async_playwright() as p:
+            timeout_s = self.config.page_timeout_ms / 1000
+            headers = {"User-Agent": "Mozilla/5.0 (research-assistant)"}
+            async with async_playwright() as p, httpx.AsyncClient(
+                follow_redirects=True, timeout=timeout_s, headers=headers
+            ) as http:
                 browser = await p.chromium.launch(headless=True)
                 page = await browser.new_page()
                 for url in urls:
+                    # PDFs can't be read via the browser DOM — fetch + extract directly.
+                    if self._is_pdf_url(url):
+                        text = await self._fetch_pdf_text(http, url)
+                        if text.strip():
+                            pdf_docs.append({"url": url, "content": text})
+                        continue
                     try:
                         await page.goto(
                             url,
@@ -140,6 +192,7 @@ class ResearchAgent:
                         continue
                 await browser.close()
         state["html_pages"] = html_pages
+        state["pdf_docs"] = pdf_docs
         return state
 
     def parse_node(self, state: State) -> State:
@@ -149,6 +202,9 @@ class ResearchAgent:
             documents.append(
                 {"url": page["url"], "content": soup.get_text(separator=" ", strip=True)}
             )
+        # PDF documents already carry extracted text — add them as-is.
+        for doc in state.get("pdf_docs", []):
+            documents.append(doc)
         state["documents"] = documents
         return state
 
