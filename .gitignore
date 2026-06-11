@@ -13,6 +13,18 @@ venv/
 env/
 ENV/
 
+# --- Local caches / browser profiles (large, machine-specific; kept off C:) ---
+.pw-browsers/
+.hf-cache/
+.chrome-profile/
+.piptmp/
+.pipcache/
+
+# --- Debug / scratch artifacts ---
+ai_overview_debug.png
+.ovtest.txt
+*.streamlit-boot*.log
+
 # --- Secrets / config ---
 .env
 *.env

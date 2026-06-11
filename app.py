@@ -16,6 +16,14 @@ from groq import Groq
 from sentence_transformers import SentenceTransformer, CrossEncoder
 
 from scraper import ResearchAgent, ScraperConfig, STEP_LABELS
+from google_ai_overview import fetch_ai_overview_sync
+
+# Persistent Chrome profile for the Quick-answer fetcher. Reusing it across runs
+# builds up cookies/trust. Kept inside the project (the C: drive is full here).
+CHROME_PROFILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".chrome-profile")
+
+RAG_MODE = "Deep research (RAG)"
+OVERVIEW_MODE = "Quick answer"
 
 st.set_page_config(page_title="Agentic Web Research", page_icon="🔎", layout="wide")
 
@@ -39,6 +47,15 @@ def get_reranker(name: str) -> CrossEncoder:
 with st.sidebar:
     st.header("⚙️ Settings")
 
+    mode = st.radio(
+        "Mode",
+        [RAG_MODE, OVERVIEW_MODE],
+        help=(
+            "Deep research: searches multiple pages and answers with RAG.\n\n"
+            "Quick answer: returns a short, direct answer."
+        ),
+    )
+
     api_key = st.text_input(
         "Groq API key",
         type="password",
@@ -46,32 +63,39 @@ with st.sidebar:
         help="Get one at https://console.groq.com/keys",
     )
     model = st.text_input("Groq model", value="llama-3.3-70b-versatile")
-    embedding_model_name = st.text_input("Embedding model", value="all-MiniLM-L6-v2")
 
-    serper_api_key = st.text_input(
-        "Serper API key (Google search)",
-        type="password",
-        value=os.getenv("SERPER_API_KEY", ""),
-        help="Free key at https://serper.dev — gives Google results. Leave blank to use DuckDuckGo.",
-    )
+    if mode == RAG_MODE:
+        embedding_model_name = st.text_input("Embedding model", value="all-MiniLM-L6-v2")
 
-    reranker_model_name = st.text_input("Reranker (cross-encoder)", value="cross-encoder/ms-marco-MiniLM-L-6-v2")
+        serper_api_key = st.text_input(
+            "Serper API key (Google search)",
+            type="password",
+            value=os.getenv("SERPER_API_KEY", ""),
+            help="Free key at https://serper.dev — gives Google results. Leave blank to use DuckDuckGo.",
+        )
 
-    max_searches = st.slider("Max search rounds", 1, 10, 3)
-    max_results = st.slider("Results per search", 3, 20, 10)
+        reranker_model_name = st.text_input("Reranker (cross-encoder)", value="cross-encoder/ms-marco-MiniLM-L-6-v2")
 
-    with st.expander("Advanced"):
-        chunk_size = st.number_input("Chunk size", 100, 2000, 700, step=50)
-        chunk_overlap = st.number_input("Chunk overlap", 0, 500, 120, step=20)
-        top_k = st.number_input("Chunks kept after rerank (top-k)", 1, 20, 5)
-        first_stage_k = st.number_input("Candidates before rerank", 5, 60, 20, step=5)
-        min_similarity = st.slider("Min cosine similarity (abstain floor)", 0.0, 0.6, 0.30, step=0.05)
-        rerank_min_score = st.slider("Min rerank score (logit floor)", -10.0, 10.0, 0.0, step=0.5)
-        page_timeout_ms = st.number_input("Page load timeout (ms)", 3000, 60000, 15000, step=1000)
-        pdf_max_pages = st.number_input("Max PDF pages to read", 5, 500, 50, step=5)
+        max_searches = st.slider("Max search rounds", 1, 10, 3)
+        max_results = st.slider("Results per search", 3, 20, 10)
 
-    st.divider()
-    st.caption("search → scrape → chunk → embed → cosine retrieve → rerank → cited answer → verify")
+        with st.expander("Advanced"):
+            chunk_size = st.number_input("Chunk size", 100, 2000, 700, step=50)
+            chunk_overlap = st.number_input("Chunk overlap", 0, 500, 120, step=20)
+            top_k = st.number_input("Chunks kept after rerank (top-k)", 1, 20, 5)
+            first_stage_k = st.number_input("Candidates before rerank", 5, 60, 20, step=5)
+            min_similarity = st.slider("Min cosine similarity (abstain floor)", 0.0, 0.6, 0.30, step=0.05)
+            rerank_min_score = st.slider("Min rerank score (logit floor)", -10.0, 10.0, 0.0, step=0.5)
+            page_timeout_ms = st.number_input("Page load timeout (ms)", 3000, 60000, 15000, step=1000)
+            pdf_max_pages = st.number_input("Max PDF pages to read", 5, 500, 50, step=5)
+
+        st.divider()
+        st.caption("search → scrape → chunk → embed → cosine retrieve → rerank → cited answer → verify")
+    else:
+        with st.expander("Advanced"):
+            overview_timeout_ms = st.number_input(
+                "Answer wait timeout (ms)", 10000, 60000, 25000, step=1000,
+            )
 
 
 # --------------------------------------------------------------------------- #
@@ -85,6 +109,64 @@ query = st.text_input(
     placeholder="e.g. How much wheat is produced in Madhya Pradesh?",
 )
 run = st.button("Research", type="primary", disabled=not query.strip())
+
+
+# --------------------------------------------------------------------------- #
+# Quick answer mode
+#
+# Internally: silently fetch the source text, then have Groq distill it into a
+# short, direct answer. The UI never reveals where the text came from.
+# --------------------------------------------------------------------------- #
+if run and mode == OVERVIEW_MODE:
+    if not api_key.strip():
+        st.error("Please enter your Groq API key in the sidebar.")
+        st.stop()
+
+    answer = ""
+    with st.spinner("Finding the answer…"):
+        try:
+            result = fetch_ai_overview_sync(
+                query.strip(),
+                user_data_dir=CHROME_PROFILE,
+                hidden=True,           # real browser, parked off-screen
+                headless=False,
+                timeout_ms=int(overview_timeout_ms),
+            )
+        except Exception:  # noqa: BLE001 - never surface internals to the user
+            result = {"text": "", "unavailable": True}
+
+        raw = (result.get("text") or "").strip()
+        if raw:
+            prompt = (
+                "Answer the user's question in a few short, clear sentences. "
+                "Be direct and to the point. Use only the information below, but "
+                "do NOT mention the information, its source, or that it was "
+                "provided to you — just answer naturally.\n\n"
+                f"Question: {query.strip()}\n\n"
+                f"Information:\n{raw}\n\nAnswer:"
+            )
+            try:
+                groq_client = Groq(api_key=api_key.strip())
+                resp = groq_client.chat.completions.create(
+                    model=model.strip(),
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                answer = (resp.choices[0].message.content or "").strip()
+            except Exception as exc:  # noqa: BLE001
+                msg = str(exc)
+                if "invalid_api_key" in msg or "401" in msg:
+                    st.error("Your Groq API key was rejected. Check it in the sidebar.")
+                else:
+                    st.error("Couldn't generate the answer. Please try again.")
+                st.stop()
+
+    st.subheader("Answer")
+    if answer:
+        st.markdown(answer)
+    else:
+        st.info("Sorry, I couldn't find an answer for that. Please try again in a moment.")
+    st.stop()
+
 
 if run:
     if not api_key.strip():
