@@ -128,8 +128,7 @@ if run and mode == OVERVIEW_MODE:
             result = fetch_ai_overview_sync(
                 query.strip(),
                 user_data_dir=CHROME_PROFILE,
-                hidden=True,           # real browser, parked off-screen
-                headless=False,
+                headless=True,         # fully invisible: no window, no taskbar
                 timeout_ms=int(overview_timeout_ms),
             )
         except Exception:  # noqa: BLE001 - never surface internals to the user
