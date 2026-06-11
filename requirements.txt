@@ -1,0 +1,18 @@
+# NOTE: On Intel Macs (x86_64), PyTorch ships no wheels after torch 2.2.2,
+# which only supports Python <= 3.12. So use a Python 3.11/3.12 venv.
+# torch 2.2.2 also requires numpy<2, and transformers 5.x is broken with it.
+streamlit
+langgraph
+ddgs
+playwright
+beautifulsoup4
+sentence-transformers
+faiss-cpu
+langchain-text-splitters
+groq
+pypdf
+httpx
+numpy<2
+transformers<5
+trafilatura          # boilerplate-free article extraction (accuracy upgrade)
+rank-bm25            # lexical half of the hybrid (FAISS + BM25) retriever
