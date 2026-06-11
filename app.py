@@ -6,6 +6,11 @@ Run with:
 
 import os
 
+# faiss and torch each bundle their own OpenMP runtime; on macOS loading both
+# can segfault. These must be set BEFORE torch/faiss are imported (below).
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+
 import streamlit as st
 from groq import Groq
 from sentence_transformers import SentenceTransformer
@@ -37,6 +42,13 @@ with st.sidebar:
     )
     model = st.text_input("Groq model", value="llama-3.3-70b-versatile")
     embedding_model_name = st.text_input("Embedding model", value="all-MiniLM-L6-v2")
+
+    serper_api_key = st.text_input(
+        "Serper API key (Google search)",
+        type="password",
+        value=os.getenv("SERPER_API_KEY", ""),
+        help="Free key at https://serper.dev — gives Google results. Leave blank to use DuckDuckGo.",
+    )
 
     max_searches = st.slider("Max search rounds", 1, 10, 5)
     max_results = st.slider("Results per search", 3, 20, 10)
@@ -79,6 +91,7 @@ if run:
         top_k=int(top_k),
         page_timeout_ms=int(page_timeout_ms),
         pdf_max_pages=int(pdf_max_pages),
+        serper_api_key=serper_api_key.strip(),
     )
 
     embedding_model = get_embedding_model(config.embedding_model_name)
@@ -102,7 +115,8 @@ if run:
             if node == "search":
                 round_no += 1
                 n_urls = len(node_state.get("urls") or [])
-                st.write(f"**Round {round_no}** — {label} · found {n_urls} URLs")
+                provider = node_state.get("search_provider", "")
+                st.write(f"**Round {round_no}** — {label} via {provider} · found {n_urls} URLs")
             elif node == "research":
                 refined = (node_state.get("query") or "").strip()
                 refined_queries.append(refined)

@@ -34,6 +34,10 @@ Then in the sidebar:
 
 - Paste your **Groq API key** (get one at <https://console.groq.com/keys>), or
   set it once via `export GROQ_API_KEY=...` before launching.
+- *(Optional)* Paste a **Serper API key** (free at <https://serper.dev>) to use
+  **Google** search instead of DuckDuckGo — much better source quality. Leave it
+  blank to fall back to DuckDuckGo (no key needed). Can also be set via
+  `export SERPER_API_KEY=...`.
 - Optionally tweak the model, number of search rounds, chunking, and retrieval
   settings.
 

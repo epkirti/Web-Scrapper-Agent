@@ -48,12 +48,14 @@ class ScraperConfig:
     page_timeout_ms: int = 15000
     pdf_max_pages: int = 50          # cap pages read per PDF (keeps embedding fast)
     pdf_max_chars: int = 400_000     # hard cap on extracted text per PDF
+    serper_api_key: str = ""         # if set, use Serper (Google); else DuckDuckGo
 
 
 class State(TypedDict, total=False):
     query: str
     original_query: str
     urls: list
+    search_provider: str
     html_pages: list
     pdf_docs: list
     documents: list
@@ -114,17 +116,48 @@ class ResearchAgent:
         return ""
 
     # ----- Graph nodes ---------------------------------------------------- #
+    def _serper_search(self, query: str) -> list:
+        """Google results via the Serper.dev JSON API."""
+        resp = httpx.post(
+            "https://google.serper.dev/search",
+            headers={
+                "X-API-KEY": self.config.serper_api_key,
+                "Content-Type": "application/json",
+            },
+            json={"q": query, "num": self.config.max_results},
+            timeout=20,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        urls = [item.get("link") for item in data.get("organic", []) if item.get("link")]
+        return urls[: self.config.max_results]
+
+    def _ddg_search(self, query: str) -> list:
+        """Fallback: DuckDuckGo via the ddgs package (no API key)."""
+        with DDGS() as ddgs:
+            results = list(ddgs.text(query, max_results=self.config.max_results))
+        return [r.get("href") or r.get("url") for r in results if r.get("href") or r.get("url")]
+
     def search_node(self, state: State) -> State:
-        try:
-            with DDGS() as ddgs:
-                results = list(ddgs.text(state["query"], max_results=self.config.max_results))
-        except Exception:
-            results = []
-        state["urls"] = [
-            r.get("href") or r.get("url")
-            for r in results
-            if r.get("href") or r.get("url")
-        ]
+        query = state["query"]
+        urls, provider = [], ""
+
+        if self.config.serper_api_key:
+            try:
+                urls = self._serper_search(query)
+                provider = "Serper (Google)"
+            except Exception:
+                urls, provider = [], "DuckDuckGo (Serper failed)"
+
+        if not urls:  # no key, or Serper returned nothing / errored
+            try:
+                urls = self._ddg_search(query)
+            except Exception:
+                urls = []
+            provider = provider or "DuckDuckGo"
+
+        state["urls"] = urls
+        state["search_provider"] = provider
         return state
 
     @staticmethod
