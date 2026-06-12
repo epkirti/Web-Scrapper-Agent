@@ -83,14 +83,20 @@ CATEGORIES = (
 )
 
 
-def _select_area(geo: dict, cur_zoom=None) -> None:
-    """Record the chosen place, clear cached category data, and queue a fly-to."""
+def _select_area(geo: dict, cur_zoom=None, news_hint: str = "") -> None:
+    """Record the chosen place, clear cached category data, and queue a fly-to.
+
+    ``news_hint`` is the user's raw search text (e.g. "Palasia Indore"). It is
+    used as the NEWS subject so searching a specific locality gives that area's
+    news, while geography/weather/etc. stay at the resolved city level. A map tap
+    has no hint, so its news falls back to the resolved area (the city)."""
     st.session_state["area_selected"] = {
         "lat": geo["lat"], "lon": geo["lon"],
         "area": geo.get("area", ""), "detail": geo.get("detail", ""),
         "locality": geo.get("locality", ""), "state": geo.get("state", ""),
         "country": geo.get("country", ""), "address": geo.get("address", {}),
         "type": geo.get("type", ""), "category": geo.get("category", ""),
+        "news_hint": (news_hint or "").strip(),
     }
     st.session_state["area_cache"] = {}  # new place -> drop old category results
     target_zoom = max(int(cur_zoom or DEFAULT_ZOOM), CLICK_ZOOM)
@@ -135,7 +141,9 @@ def render_area_map(api_key: str, model: str, serper_api_key: str,
         with st.spinner(f"Locating “{q}”…"):
             geo = forward_geocode(q)
         if geo.get("lat") is not None:
-            _select_area(geo)
+            # Use the typed query as the news subject so searching a specific
+            # locality (e.g. "Palasia Indore") yields that area's news.
+            _select_area(geo, news_hint=q)
             st.rerun()
         else:
             st.warning(f"Couldn't locate “{q}”. Try a more specific name.")
@@ -237,6 +245,12 @@ def render_area_map(api_key: str, model: str, serper_api_key: str,
         _render_area_chat(sel, api_key, model, serper_api_key)
 
 
+def _news_subject(sel: dict) -> str:
+    """What the news is about: the typed search text if any (so a searched
+    locality gives that area's news), otherwise the resolved area (the city)."""
+    return (sel.get("news_hint") or "").strip() or sel.get("area", "")
+
+
 def _get_category_data(category, sel, api_key, model, serper_api_key, news_count, do_summary):
     """Fetch (and cache per category) the data for the selected place."""
     cache = st.session_state.setdefault("area_cache", {})
@@ -246,11 +260,17 @@ def _get_category_data(category, sel, api_key, model, serper_api_key, news_count
     lat, lon = sel["lat"], sel["lon"]
     place = sel.get("area", "")
     if category.endswith("News"):
-        items = fetch_area_news(place, serper_api_key=serper_api_key, max_results=news_count)
+        subject = _news_subject(sel)
+        items = fetch_area_news(subject, serper_api_key=serper_api_key, max_results=news_count)
+        # If a specific searched locality returned little, widen to the city.
+        if subject != place and place and len(items) < 2:
+            city_items = fetch_area_news(place, serper_api_key=serper_api_key, max_results=news_count)
+            if len(city_items) > len(items):
+                items, subject = city_items, place
         summary = ""
         if do_summary and items and api_key.strip():
-            summary = summarize_news(Groq(api_key=api_key.strip()), model.strip(), place, items)
-        data = {"items": items, "summary": summary}
+            summary = summarize_news(Groq(api_key=api_key.strip()), model.strip(), subject, items)
+        data = {"items": items, "summary": summary, "subject": subject}
     elif "Weather" in category:
         data = fetch_weather(lat, lon)
     elif "Geography" in category:
@@ -273,32 +293,45 @@ def _get_category_data(category, sel, api_key, model, serper_api_key, news_count
     # Only cache results that actually carry content, so a transient network
     # failure (empty result) is retried next time rather than sticking.
     cacheable = bool(data) and (not isinstance(data, dict) or any(data.values()))
-    # For knowledge topics, if a key is set but the AI summary came back empty
-    # (a transient LLM failure), don't cache — so re-viewing retries the summary.
-    if category in KNOWLEDGE_TOPICS and api_key.strip() and not (data or {}).get("summary"):
-        cacheable = False
+    # If a key is set but the AI summary/digest came back empty despite having
+    # material (a transient LLM failure), don't cache — so re-viewing retries it.
+    if api_key.strip() and not (data or {}).get("summary"):
+        if category in KNOWLEDGE_TOPICS and (data or {}).get("sources"):
+            cacheable = False
+        elif category.endswith("News") and (data or {}).get("items"):
+            cacheable = False
     if cacheable:
         cache[category] = data
     return data
 
 
 def _render_news(data, sel, api_key, model, serper_api_key):
-    st.subheader(f"📰 News for {sel.get('area') or 'this area'}")
-    if data.get("summary"):
-        st.markdown(data["summary"])
-        st.divider()
+    subject = data.get("subject") or sel.get("area") or "this area"
+    st.subheader(f"📰 News — {subject}")
+
     items = data.get("items") or []
+    summary = data.get("summary", "")
+
+    # Concise digest first: the consolidated "everything in one place" view.
+    if summary:
+        st.info(f"**📋 In short**\n\n{summary}")
+    elif items and not api_key.strip():
+        st.caption("🔑 Add a Groq API key in the sidebar for a concise digest of the headlines below.")
+
     if not items:
         st.warning("No news found for this area. Try a nearby point or a larger place.")
-    for it in items:
-        title, url = it.get("title", ""), it.get("url", "")
-        st.markdown(f"**[{title}]({url})**" if url else f"**{title}**")
-        meta = " · ".join(x for x in [it.get("source", ""), it.get("date", "")] if x)
-        if meta:
-            st.caption(meta)
-        if it.get("snippet"):
-            st.write(it["snippet"])
-        st.divider()
+    else:
+        # Headlines below the digest, collapsed by default once we have a digest.
+        with st.expander(f"📰 All headlines ({len(items)})", expanded=not summary):
+            for it in items:
+                title, url = it.get("title", ""), it.get("url", "")
+                st.markdown(f"**[{title}]({url})**" if url else f"**{title}**")
+                meta = " · ".join(x for x in [it.get("source", ""), it.get("date", "")] if x)
+                if meta:
+                    st.caption(meta)
+                if it.get("snippet"):
+                    st.write(it["snippet"])
+                st.divider()
 
     if api_key.strip() and st.button("🔬 Deep dive — cited summary of this area"):
         config = ScraperConfig(model=model.strip(), serper_api_key=serper_api_key.strip())
@@ -307,7 +340,7 @@ def _render_news(data, sel, api_key, model, serper_api_key):
         agent = ResearchAgent(Groq(api_key=api_key.strip()), emb, config, reranker=rer)
         try:
             with st.spinner("Running deep research on this area…"):
-                result = agent.research(f"latest news about {sel.get('area')}")
+                result = agent.research(f"latest news about {subject}")
         except Exception as exc:  # match the graceful handling of the main RAG flow
             st.error(f"Deep dive failed ({type(exc).__name__}). Please try again.")
             result = {}

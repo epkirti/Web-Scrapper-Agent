@@ -394,10 +394,8 @@ def fetch_area_news(
 # Optional: short AI summary of an area's headlines
 # --------------------------------------------------------------------------- #
 def summarize_news(groq_client, model: str, area: str, items: list[dict]) -> str:
-    """A short, neutral 2-4 sentence summary built ONLY from the given headlines.
-
-    Returns "" if there is nothing to summarize or the call fails.
-    """
+    """A concise digest of the area's news, consolidating many publications into
+    one place. Returns "" if there is nothing to summarize or the call fails."""
     if not items:
         return ""
     lines = "\n".join(
@@ -405,10 +403,13 @@ def summarize_news(groq_client, model: str, area: str, items: list[dict]) -> str
         for it in items
     )
     prompt = (
-        f"Below are recent news headlines about {area}. Write a short, neutral "
-        "2-4 sentence summary of what is happening there. Use ONLY these headlines; "
-        "do not invent any details.\n\n"
-        f"{lines}\n\nSummary:"
+        f"You are a news editor. Below are recent headlines about {area} from many "
+        "publications. Write a CONCISE digest (3-5 sentences, or up to 5 short "
+        "bullet points) that consolidates them into one place, so the reader does "
+        "not have to open every article. Lead with the most important development; "
+        "group related items; keep it neutral and factual. Use ONLY these "
+        "headlines — do not invent details.\n\n"
+        f"{lines}\n\nConcise news digest:"
     )
     try:
         resp = groq_client.chat.completions.create(
