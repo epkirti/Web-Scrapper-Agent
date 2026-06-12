@@ -481,6 +481,43 @@ def fetch_area_news(
 # --------------------------------------------------------------------------- #
 # Optional: short AI summary of an area's headlines
 # --------------------------------------------------------------------------- #
+def list_localities(groq_client, model: str, city: str, n: int = 12) -> list[str]:
+    """Ask the LLM for the well-known neighbourhoods/localities of a city, so the
+    user can get news for a specific area (e.g. Bhawarkua, Vijay Nagar in Indore)
+    even though map data doesn't reliably name them. Returns [] on failure."""
+    if not city.strip():
+        return []
+    prompt = (
+        f"List up to {n} well-known neighbourhoods, localities or areas WITHIN the "
+        f"city of {city}. Return ONLY a comma-separated list of the area names — no "
+        "numbering, no description, no extra words. If the place is not a city with "
+        "distinct named localities, return nothing."
+    )
+    try:
+        resp = groq_client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0, max_tokens=200,
+        )
+        raw = resp.choices[0].message.content or ""
+    except Exception:
+        return []
+
+    out, seen = [], set()
+    for part in raw.replace("\n", ",").split(","):
+        # Drop any leading list markers / numbering (e.g. "1.", "-", "•").
+        name = part.strip().lstrip("0123456789.)-•*# \t").strip()
+        low = name.lower()
+        if (
+            name and low not in seen and 1 < len(name) < 40
+            and not low.startswith(("here", "sure", "the city", "some ", "okay", "i "))
+            and city.lower() != low
+        ):
+            seen.add(low)
+            out.append(name)
+    return out[:n]
+
+
 def summarize_news(groq_client, model: str, area: str, items: list[dict],
                    lang: str = "English") -> str:
     """A concise digest of the area's news, consolidating many publications into

@@ -34,7 +34,7 @@ from google_ai_overview import fetch_ai_overview_sync
 from news_map import (
     reverse_geocode, forward_geocode, fetch_area_news, summarize_news,
     fetch_weather, fetch_elevation, fetch_wikipedia_summary,
-    web_search, summarize_topic, fetch_air_quality, fetch_astro,
+    web_search, summarize_topic, fetch_air_quality, fetch_astro, list_localities,
 )
 
 # Persistent Chrome profile for the Quick-answer fetcher. Reusing it across runs
@@ -113,6 +113,7 @@ def _select_area(geo: dict, cur_zoom=None, news_hint: str = "") -> None:
         "news_hint": (news_hint or "").strip(),
     }
     st.session_state["area_cache"] = {}  # new place -> drop old category results
+    st.session_state["area_subarea"] = ""  # reset locality focus for the new place
 
     # Keep a short most-recent-first list of selected places for quick re-select.
     entry = dict(st.session_state["area_selected"])
@@ -144,6 +145,9 @@ def _build_report(sel: dict) -> str:
     for cat, d in (st.session_state.get("area_cache") or {}).items():
         if not isinstance(d, dict):
             continue
+        if cat.startswith("News::"):  # composite news key -> readable heading
+            sub = cat.split("::", 1)[1]
+            cat = f"📰 News{f' — {sub}' if sub else ''}"
         lines.append(f"## {cat}")
         if d.get("summary"):
             lines.append(d["summary"])
@@ -339,16 +343,23 @@ def _get_category_data(category, sel, api_key, model, serper_api_key, news_count
                        news_time="", out_lang="English"):
     """Fetch (and cache per category) the data for the selected place."""
     cache = st.session_state.setdefault("area_cache", {})
-    if category in cache:
-        return cache[category]
+    # News is also keyed by the chosen locality focus, so switching areas refetches.
+    subarea = st.session_state.get("area_subarea", "")
+    cache_key = f"News::{subarea}" if category.endswith("News") else category
+    if cache_key in cache:
+        return cache[cache_key]
 
     lat, lon = sel["lat"], sel["lon"]
     place = sel.get("area", "")
     if category.endswith("News"):
-        subject = _news_subject(sel)
+        city = sel.get("locality") or place
+        if subarea:  # focus on a specific locality within the city
+            subject = f"{subarea}, {city}" if city else subarea
+        else:
+            subject = _news_subject(sel)
         items = fetch_area_news(subject, serper_api_key=serper_api_key,
                                 max_results=news_count, time_filter=news_time)
-        # If a specific searched locality returned little, widen to the city.
+        # If a specific area returned little, widen to the whole city so it's not empty.
         if subject != place and place and len(items) < 2:
             city_items = fetch_area_news(place, serper_api_key=serper_api_key,
                                          max_results=news_count, time_filter=news_time)
@@ -393,11 +404,46 @@ def _get_category_data(category, sel, api_key, model, serper_api_key, news_count
         elif category.endswith("News") and (data or {}).get("items"):
             cacheable = False
     if cacheable:
-        cache[category] = data
+        cache[cache_key] = data
     return data
 
 
+def _get_localities(city: str, api_key: str, model: str) -> list:
+    """City localities (LLM-generated, cached per city) for the area-news dropdown."""
+    if not city.strip() or not api_key.strip():
+        return []
+    cache = st.session_state.setdefault("localities_cache", {})
+    key = city.strip().lower()
+    if key in cache:
+        return cache[key]
+    locs = list_localities(Groq(api_key=api_key.strip()), model.strip(), city)
+    if locs:  # don't cache an empty (possibly transient) result
+        cache[key] = locs
+    return locs
+
+
 def _render_news(data, sel, api_key, model, serper_api_key):
+    # Locality focus: pick a specific area within the city for area-specific news.
+    city = (sel.get("locality") or sel.get("area", "").split(",")[0] or "").strip()
+    localities = _get_localities(city, api_key, model)
+    if localities:
+        all_label = f"All of {city}"
+        options = [all_label] + localities
+        cur = st.session_state.get("area_subarea", "")
+        idx = options.index(cur) if cur in options else 0
+        choice = st.selectbox(
+            f"📍 Area within {city} (for area-specific news)", options, index=idx,
+            key=f"subarea_select_{city}",
+        )
+        new_sub = "" if choice == all_label else choice
+        if new_sub != st.session_state.get("area_subarea", ""):
+            st.session_state["area_subarea"] = new_sub
+            st.rerun()
+    else:
+        # No locality list (no Groq key, or none generated) — guide manual drill-down.
+        st.caption("Tip: search a specific area (e.g. “Bhawarkua Indore”) for that locality's news. "
+                   "Add a Groq key to get a one-tap locality picker here.")
+
     subject = data.get("subject") or sel.get("area") or "this area"
     st.subheader(f"📰 News — {subject}")
 
