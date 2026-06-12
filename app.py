@@ -17,6 +17,7 @@ from sentence_transformers import SentenceTransformer, CrossEncoder
 
 from scraper import ResearchAgent, ScraperConfig, STEP_LABELS
 from google_ai_overview import fetch_ai_overview_sync
+from news_map import reverse_geocode, fetch_area_news, summarize_news
 
 # Persistent Chrome profile for the Quick-answer fetcher. Reusing it across runs
 # builds up cookies/trust. Kept inside the project (the C: drive is full here).
@@ -24,6 +25,7 @@ CHROME_PROFILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".chro
 
 RAG_MODE = "Deep research (RAG)"
 OVERVIEW_MODE = "Quick answer"
+NEWS_MAP_MODE = "News map"
 
 st.set_page_config(page_title="Agentic Web Research", page_icon="🔎", layout="wide")
 
@@ -42,6 +44,137 @@ def get_reranker(name: str) -> CrossEncoder:
 
 
 # --------------------------------------------------------------------------- #
+# News map page — tap a location, see its news
+# --------------------------------------------------------------------------- #
+def render_news_map(api_key: str, model: str, serper_api_key: str,
+                    news_count: int, do_summary: bool) -> None:
+    """Interactive Folium map: tapping a point reverse-geocodes it to an area and
+    loads recent news for that area. State is kept in session_state because
+    st_folium re-runs the script on every map interaction."""
+    import folium
+    from streamlit_folium import st_folium
+
+    st.caption("Tap anywhere on the map to load recent news for that area.")
+
+    DEFAULT_CENTER = [22.97, 78.65]  # India
+    DEFAULT_ZOOM = 4
+    CLICK_ZOOM = 11  # zoom level we fly to when a point is tapped
+
+    fmap = folium.Map(location=DEFAULT_CENTER, zoom_start=DEFAULT_ZOOM, tiles="OpenStreetMap")
+    last = st.session_state.get("news_last_click")
+    if last:  # pin the currently selected spot
+        coord_str = f"{last['lat']:.5f}, {last['lon']:.5f}"
+        folium.Marker(
+            [last["lat"], last["lon"]],
+            tooltip=f"{last.get('area') or 'Selected area'} ({coord_str})",
+            popup=folium.Popup(
+                f"<b>{last.get('area') or 'Selected area'}</b><br>"
+                f"Lat: {last['lat']:.5f}<br>Lon: {last['lon']:.5f}",
+                max_width=260,
+            ),
+            icon=folium.Icon(color="red", icon="info-sign"),
+        ).add_to(fmap)
+
+    # One-shot programmatic view: set right after a click so the map flies into
+    # (and zooms into) the tapped location. Popped so it only applies once —
+    # afterwards the stable `key` lets the user pan/zoom freely without it
+    # snapping back on every rerun.
+    force_view = st.session_state.pop("news_force_view", None)
+
+    col_map, col_news = st.columns([3, 2])
+    with col_map:
+        map_state = st_folium(
+            fmap,
+            key="news_map",  # stable key preserves the user's view across reruns
+            center=force_view["center"] if force_view else None,
+            zoom=force_view["zoom"] if force_view else None,
+            height=540,
+            use_container_width=True,
+        )
+        # Live read-out of the most recent click, right under the map.
+        live = (map_state or {}).get("last_clicked")
+        if live:
+            st.caption(f"📍 Clicked coordinates — Lat `{live['lat']:.5f}`, Lon `{live['lng']:.5f}`")
+
+    # A fresh click? (compare against what we last loaded)
+    clicked = map_state.get("last_clicked") if map_state else None
+    if clicked:
+        lat, lon = clicked["lat"], clicked["lng"]
+        prev = st.session_state.get("news_last_click")
+        is_new = (
+            prev is None
+            or abs(prev["lat"] - lat) > 1e-6
+            or abs(prev["lon"] - lon) > 1e-6
+        )
+        if is_new:
+            with st.spinner("Locating the area and fetching its news…"):
+                geo = reverse_geocode(lat, lon)
+                area = geo.get("area") or f"{lat:.3f}, {lon:.3f}"
+                items = fetch_area_news(area, serper_api_key=serper_api_key, max_results=news_count)
+                summary = ""
+                if do_summary and items and api_key.strip():
+                    summary = summarize_news(Groq(api_key=api_key.strip()), model.strip(), area, items)
+            st.session_state["news_last_click"] = {
+                "lat": lat, "lon": lon, "area": area,
+                "detail": geo.get("detail", ""), "items": items, "summary": summary,
+            }
+            # Zoom into the tapped spot (don't zoom back out if already closer in).
+            cur_zoom = (map_state or {}).get("zoom") or DEFAULT_ZOOM
+            st.session_state["news_force_view"] = {
+                "center": [lat, lon], "zoom": max(int(cur_zoom), CLICK_ZOOM),
+            }
+            st.rerun()  # redraw with the marker, zoomed into the location, news loaded
+
+    with col_news:
+        data = st.session_state.get("news_last_click")
+        if not data:
+            st.info("👆 Tap a location on the map to load its news.")
+            return
+
+        # --- What was clicked & where it resolved to -------------------- #
+        st.markdown(
+            f"**📍 Clicked coordinates**  \n"
+            f"Latitude: `{data['lat']:.5f}`  ·  Longitude: `{data['lon']:.5f}`"
+        )
+        st.markdown(f"**🗺️ Resolved location:** {data.get('area') or 'Unknown area'}")
+        if data.get("detail"):
+            st.caption(f"Reverse-geocoded address: {data['detail']}")
+        st.divider()
+
+        st.subheader(f"📰 News for {data.get('area') or 'this area'}")
+        if data.get("summary"):
+            st.markdown(data["summary"])
+            st.divider()
+
+        items = data.get("items") or []
+        if not items:
+            st.warning("No news found for this area. Try a nearby point or a larger place.")
+        for it in items:
+            title = it.get("title", "")
+            url = it.get("url", "")
+            st.markdown(f"**[{title}]({url})**" if url else f"**{title}**")
+            meta = " · ".join(x for x in [it.get("source", ""), it.get("date", "")] if x)
+            if meta:
+                st.caption(meta)
+            if it.get("snippet"):
+                st.write(it["snippet"])
+            st.divider()
+
+        # Optional deep dive: reuse the full cited-RAG pipeline for this area.
+        if api_key.strip() and st.button("🔬 Deep dive — cited summary of this area"):
+            config = ScraperConfig(model=model.strip(), serper_api_key=serper_api_key.strip())
+            emb = get_embedding_model(config.embedding_model_name)
+            rer = get_reranker(config.reranker_model_name) if config.reranker_model_name else None
+            agent = ResearchAgent(Groq(api_key=api_key.strip()), emb, config, reranker=rer)
+            with st.spinner("Running deep research on this area…"):
+                result = agent.research(f"latest news about {data.get('area')}")
+            st.markdown(result.get("answer") or "_No answer was produced._")
+            score = result.get("confidence_score")
+            if score is not None:
+                st.caption(f"Confidence score {score:.2f}")
+
+
+# --------------------------------------------------------------------------- #
 # Sidebar — configuration
 # --------------------------------------------------------------------------- #
 with st.sidebar:
@@ -49,10 +182,11 @@ with st.sidebar:
 
     mode = st.radio(
         "Mode",
-        [RAG_MODE, OVERVIEW_MODE],
+        [RAG_MODE, OVERVIEW_MODE, NEWS_MAP_MODE],
         help=(
             "Deep research: searches multiple pages and answers with RAG.\n\n"
-            "Quick answer: returns a short, direct answer."
+            "Quick answer: returns a short, direct answer.\n\n"
+            "News map: tap a place on a map to see its news."
         ),
     )
 
@@ -91,11 +225,22 @@ with st.sidebar:
 
         st.divider()
         st.caption("search → scrape → chunk → embed → cosine retrieve → rerank → cited answer → verify")
-    else:
+    elif mode == OVERVIEW_MODE:
         with st.expander("Advanced"):
             overview_timeout_ms = st.number_input(
                 "Answer wait timeout (ms)", 10000, 60000, 25000, step=1000,
             )
+    else:  # NEWS_MAP_MODE
+        serper_api_key = st.text_input(
+            "Serper API key (Google News)",
+            type="password",
+            value=os.getenv("SERPER_API_KEY", ""),
+            help="Free key at https://serper.dev — gives Google News. Leave blank to use DuckDuckGo.",
+        )
+        news_count = st.slider("Headlines per area", 3, 20, 8)
+        do_summary = st.checkbox("AI summary of the area's news", value=True)
+        st.divider()
+        st.caption("tap point → reverse-geocode → fetch area news → optional AI summary")
 
 
 # --------------------------------------------------------------------------- #
@@ -103,6 +248,11 @@ with st.sidebar:
 # --------------------------------------------------------------------------- #
 st.title("🔎 Agentic Web Research Assistant")
 st.caption("LangGraph agent that searches the web, scrapes pages, and answers with RAG over what it finds.")
+
+# News map mode is fully self-contained (its own map + click handling).
+if mode == NEWS_MAP_MODE:
+    render_news_map(api_key, model, serper_api_key, news_count, do_summary)
+    st.stop()
 
 query = st.text_input(
     "Your question",

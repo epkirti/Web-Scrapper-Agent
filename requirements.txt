@@ -2,6 +2,8 @@
 # which only supports Python <= 3.12. So use a Python 3.11/3.12 venv.
 # torch 2.2.2 also requires numpy<2, and transformers 5.x is broken with it.
 streamlit
+streamlit-folium
+folium
 langgraph
 ddgs
 playwright
