@@ -11,6 +11,14 @@ import os
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 
+# Use the project-local HuggingFace cache so the pre-downloaded embedding /
+# reranker models are found regardless of how the app is launched (e.g.
+# `streamlit run app.py` directly, not only via run.ps1). Must be set BEFORE
+# sentence_transformers / transformers are imported below.
+os.environ.setdefault(
+    "HF_HOME", os.path.join(os.path.dirname(os.path.abspath(__file__)), ".hf-cache")
+)
+
 import streamlit as st
 from groq import Groq
 from sentence_transformers import SentenceTransformer, CrossEncoder
@@ -86,13 +94,13 @@ def _select_area(geo: dict, cur_zoom=None) -> None:
     }
     st.session_state["area_cache"] = {}  # new place -> drop old category results
     target_zoom = max(int(cur_zoom or DEFAULT_ZOOM), CLICK_ZOOM)
+    # Persisted view = where the map is rebuilt from on plain reruns (category
+    # switch, chat). A one-shot force_view actually flies the map there on select.
+    st.session_state["area_view_center"] = [geo["lat"], geo["lon"]]
+    st.session_state["area_view_zoom"] = target_zoom
     st.session_state["area_force_view"] = {
         "center": [geo["lat"], geo["lon"]], "zoom": target_zoom,
     }
-    # Also store as the persisted view so later reruns (e.g. switching the
-    # category dropdown) rebuild the map here instead of snapping back to default.
-    st.session_state["area_view_center"] = [geo["lat"], geo["lon"]]
-    st.session_state["area_view_zoom"] = target_zoom
 
 
 def render_area_map(api_key: str, model: str, serper_api_key: str,
@@ -151,27 +159,25 @@ def render_area_map(api_key: str, model: str, serper_api_key: str,
             icon=folium.Icon(color="red", icon="info-sign"),
         ).add_to(fmap)
 
-    # One-shot programmatic view so the map flies into the selected place once.
+    # One-shot fly-to: only set right after a place is selected, so the map moves
+    # there exactly once. It's popped, so plain reruns don't re-apply it.
     force_view = st.session_state.pop("area_force_view", None)
 
     col_map, col_info = st.columns([3, 2])
     with col_map:
+        # returned_objects=["last_clicked"] is the key fix: st_folium then re-runs
+        # ONLY on a click — never on pan/zoom. So the user can freely zoom in and
+        # the map will NOT snap back on a debounced rerun. center/zoom are passed
+        # only on a deliberate selection (force_view) to fly the map there.
         map_state = st_folium(
             fmap,
-            key="area_map",  # stable key preserves the user's view across reruns
+            key="area_map",
             center=force_view["center"] if force_view else None,
             zoom=force_view["zoom"] if force_view else None,
+            returned_objects=["last_clicked"],
             height=540,
             use_container_width=True,
         )
-
-    # Remember the user's current view so the next rerun rebuilds the map here.
-    if map_state:
-        c = map_state.get("center")
-        if c:
-            st.session_state["area_view_center"] = [c["lat"], c["lng"]]
-        if map_state.get("zoom"):
-            st.session_state["area_view_zoom"] = map_state["zoom"]
 
     # ----- Handle a fresh map tap (reverse geocode) ---------------------- #
     clicked = (map_state or {}).get("last_clicked")
@@ -223,6 +229,13 @@ def render_area_map(api_key: str, model: str, serper_api_key: str,
         else:  # Overview
             _render_overview(data, sel)
 
+    # ----- Place-scoped chatbot (full width, below the map + info) ------- #
+    # st.chat_input cannot live inside a column/expander, so it sits here at the
+    # page body level. Only shown once a place is selected.
+    sel = st.session_state.get("area_selected")
+    if sel:
+        _render_area_chat(sel, api_key, model, serper_api_key)
+
 
 def _get_category_data(category, sel, api_key, model, serper_api_key, news_count, do_summary):
     """Fetch (and cache per category) the data for the selected place."""
@@ -259,7 +272,12 @@ def _get_category_data(category, sel, api_key, model, serper_api_key, news_count
 
     # Only cache results that actually carry content, so a transient network
     # failure (empty result) is retried next time rather than sticking.
-    if data and (not isinstance(data, dict) or any(data.values())):
+    cacheable = bool(data) and (not isinstance(data, dict) or any(data.values()))
+    # For knowledge topics, if a key is set but the AI summary came back empty
+    # (a transient LLM failure), don't cache — so re-viewing retries the summary.
+    if category in KNOWLEDGE_TOPICS and api_key.strip() and not (data or {}).get("summary"):
+        cacheable = False
+    if cacheable:
         cache[category] = data
     return data
 
@@ -287,8 +305,12 @@ def _render_news(data, sel, api_key, model, serper_api_key):
         emb = get_embedding_model(config.embedding_model_name)
         rer = get_reranker(config.reranker_model_name) if config.reranker_model_name else None
         agent = ResearchAgent(Groq(api_key=api_key.strip()), emb, config, reranker=rer)
-        with st.spinner("Running deep research on this area…"):
-            result = agent.research(f"latest news about {sel.get('area')}")
+        try:
+            with st.spinner("Running deep research on this area…"):
+                result = agent.research(f"latest news about {sel.get('area')}")
+        except Exception as exc:  # match the graceful handling of the main RAG flow
+            st.error(f"Deep dive failed ({type(exc).__name__}). Please try again.")
+            result = {}
         st.markdown(result.get("answer") or "_No answer was produced._")
         score = result.get("confidence_score")
         if score is not None:
@@ -344,13 +366,28 @@ def _render_topic(category, data, sel, api_key, serper_api_key):
     sources = (data or {}).get("sources") or []
 
     if summary:
+        # Best case: an AI-written summary from the sources.
         st.markdown(summary)
-    elif not api_key.strip():
-        st.info("Add a Groq API key in the sidebar for a written summary. "
-                "Showing the top sources below.")
-    elif not sources:
+    elif sources:
+        # No AI summary (no Groq key, or the model call failed/returned nothing) —
+        # still show readable content by surfacing the source snippets themselves,
+        # so the topic is never just a list of bare links.
+        if not api_key.strip():
+            st.caption("🔑 Add a Groq API key in the sidebar for a written summary. "
+                       "Here's what the sources say:")
+        else:
+            st.caption("Here's what the sources say:")
+        any_body = False
+        for s in sources:
+            body = (s.get("snippet") or "").strip()
+            if body:
+                any_body = True
+                st.markdown(f"**{s.get('title', '')}**  \n{body}")
+        if not any_body:
+            st.info("The sources didn't include readable summaries. See the links below.")
+    else:
         st.warning("Couldn't find information on this for this place. "
-                   "Try a larger/known place name.")
+                   "Try a larger or more well-known place name.")
 
     if sources:
         st.divider()
@@ -370,6 +407,114 @@ def _render_overview(data, sel):
     st.write(data["extract"])
     if data.get("url"):
         st.markdown(f"[Read more on Wikipedia]({data['url']})")
+
+
+# --------------------------------------------------------------------------- #
+# Place-scoped chatbot — ask follow-up questions about the selected place
+# --------------------------------------------------------------------------- #
+def _area_chat_context(sel: dict, snippets: list | None = None, max_chars: int = 4500) -> str:
+    """Ground the chatbot in the place's facts, anything already fetched for it
+    (cached category results), and fresh web snippets for the current question."""
+    parts = []
+
+    facts = []
+    for key, label in (("locality", "Locality"), ("state", "State/region"),
+                       ("country", "Country"), ("type", "Place type")):
+        if sel.get(key):
+            facts.append(f"{label}: {sel[key]}")
+    facts.append(f"Coordinates: {sel['lat']:.4f}, {sel['lon']:.4f}")
+    parts.append("PLACE FACTS:\n" + "\n".join(facts))
+
+    # Reuse whatever the user already loaded for this place (news, weather, …).
+    for cat, d in (st.session_state.get("area_cache") or {}).items():
+        if not isinstance(d, dict):
+            continue
+        bits = []
+        if d.get("summary"):
+            bits.append(d["summary"])
+        if d.get("extract"):
+            bits.append(d["extract"])
+        if d.get("items"):
+            heads = "; ".join(it.get("title", "") for it in d["items"][:6] if it.get("title"))
+            if heads:
+                bits.append("Recent headlines: " + heads)
+        if d.get("condition"):  # weather payload
+            bits.append(f"Current weather: {d.get('condition')}, {d.get('temp')}°C")
+        if bits:
+            parts.append(f"{cat}:\n" + "\n".join(bits))
+
+    if snippets:
+        web = "\n".join(
+            f"- {s.get('title', '')}: {s.get('snippet', '')}".strip(" -:")
+            for s in snippets if s.get("title") or s.get("snippet")
+        )
+        if web:
+            parts.append("WEB RESULTS FOR THIS QUESTION:\n" + web)
+
+    return "\n\n".join(parts)[:max_chars]
+
+
+def _area_chat_reply(client, model: str, place: str, context: str, history: list) -> str:
+    """A concise, accurate answer about the place, grounded in CONTEXT, falling
+    back to general knowledge when the context doesn't cover the question."""
+    system = (
+        f"You are a knowledgeable, friendly guide answering questions about {place}. "
+        "Use the CONTEXT below as your primary source when it is relevant. If the "
+        "context does not cover the question, answer from reliable general knowledge, "
+        "clearly and concisely. If you genuinely do not know, say so honestly rather "
+        f"than guessing. Keep answers accurate and to the point.\n\nCONTEXT:\n{context}"
+    )
+    messages = [{"role": "system", "content": system}, *history[-8:]]
+    resp = client.chat.completions.create(
+        model=model, messages=messages, temperature=0.3, max_tokens=600,
+    )
+    return resp.choices[0].message.content or ""
+
+
+def _render_area_chat(sel: dict, api_key: str, model: str, serper_api_key: str) -> None:
+    place = sel.get("area") or "this place"
+    st.divider()
+    st.subheader(f"💬 Ask about {place}")
+    st.caption("Ask follow-up questions — answers use what's been gathered here plus a quick web check.")
+
+    # History is scoped to this place and resets when a new place is chosen.
+    sig = f"{sel['lat']:.5f},{sel['lon']:.5f}"
+    if st.session_state.get("area_chat_sig") != sig:
+        st.session_state["area_chat_sig"] = sig
+        st.session_state["area_chat"] = []
+
+    for msg in st.session_state.get("area_chat", []):
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    # Only show the input once a key is present — a persistent note otherwise
+    # (a transient on-submit warning would just flash and vanish on the next rerun).
+    if not api_key.strip():
+        st.info("🔑 Add a Groq API key in the sidebar to chat about this place.")
+        return
+
+    user_q = st.chat_input(f"e.g. What is {place} famous for? Best time to visit?")
+    if not user_q:
+        return
+
+    st.session_state["area_chat"].append({"role": "user", "content": user_q})
+    with st.chat_message("user"):
+        st.markdown(user_q)
+
+    with st.chat_message("assistant"):
+        with st.spinner("Thinking…"):
+            try:
+                snippets = web_search(f"{place} {user_q}", serper_api_key=serper_api_key, max_results=5)
+                context = _area_chat_context(sel, snippets)
+                reply = _area_chat_reply(
+                    Groq(api_key=api_key.strip()), model.strip(), place, context,
+                    st.session_state["area_chat"],
+                )
+            except Exception as exc:  # surfaced, never crashes the chat
+                reply = f"Sorry, I couldn't answer that just now ({type(exc).__name__})."
+        st.markdown(reply)
+
+    st.session_state["area_chat"].append({"role": "assistant", "content": reply})
 
 
 # --------------------------------------------------------------------------- #
