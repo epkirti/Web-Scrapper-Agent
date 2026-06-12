@@ -217,6 +217,82 @@ def fetch_elevation(lat: float, lon: float, timeout: float = 15.0) -> Optional[f
     return None
 
 
+# US AQI bands -> human label (Open-Meteo returns the US AQI scale).
+def _aqi_label(aqi) -> str:
+    if aqi is None:
+        return ""
+    try:
+        a = float(aqi)
+    except (TypeError, ValueError):
+        return ""
+    if a <= 50:
+        return "Good"
+    if a <= 100:
+        return "Moderate"
+    if a <= 150:
+        return "Unhealthy for sensitive groups"
+    if a <= 200:
+        return "Unhealthy"
+    if a <= 300:
+        return "Very unhealthy"
+    return "Hazardous"
+
+
+def fetch_air_quality(lat: float, lon: float, timeout: float = 15.0) -> dict:
+    """Current air quality (US AQI + PM2.5/PM10) via Open-Meteo. {} on failure."""
+    try:
+        resp = httpx.get(
+            "https://air-quality-api.open-meteo.com/v1/air-quality",
+            params={
+                "latitude": lat, "longitude": lon,
+                "current": "us_aqi,pm2_5,pm10",
+            },
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        cur = resp.json().get("current") or {}
+    except Exception:
+        return {}
+    if not cur:
+        return {}
+    aqi = cur.get("us_aqi")
+    return {"aqi": aqi, "label": _aqi_label(aqi),
+            "pm2_5": cur.get("pm2_5"), "pm10": cur.get("pm10")}
+
+
+def fetch_astro(lat: float, lon: float, timeout: float = 15.0) -> dict:
+    """Local timezone + today's sunrise/sunset via Open-Meteo. {} on failure.
+
+    Returns ``{timezone, sunrise, sunset}`` where sunrise/sunset are local
+    ``HH:MM`` strings.
+    """
+    try:
+        resp = httpx.get(
+            "https://api.open-meteo.com/v1/forecast",
+            params={
+                "latitude": lat, "longitude": lon,
+                "daily": "sunrise,sunset", "timezone": "auto", "forecast_days": 1,
+            },
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        j = resp.json()
+    except Exception:
+        return {}
+    daily = j.get("daily") or {}
+
+    def _hhmm(values):
+        if isinstance(values, list) and values and isinstance(values[0], str) and "T" in values[0]:
+            return values[0].split("T", 1)[1][:5]
+        return ""
+
+    return {
+        "timezone": j.get("timezone", ""),
+        "sunrise": _hhmm(daily.get("sunrise")),
+        "sunset": _hhmm(daily.get("sunset")),
+    }
+
+
 # --------------------------------------------------------------------------- #
 # Overview (Wikipedia REST summary — free, no key)
 # --------------------------------------------------------------------------- #
@@ -293,7 +369,8 @@ def web_search(query: str, serper_api_key: str = "", max_results: int = 6,
 
 
 def summarize_topic(groq_client, model: str, place: str, topic: str,
-                    snippets: list[dict], wiki_extract: str = "") -> str:
+                    snippets: list[dict], wiki_extract: str = "",
+                    lang: str = "English") -> str:
     """Write a focused, factual summary about one ``topic`` of a ``place`` using
     ONLY the supplied web snippets (+ optional Wikipedia extract). Returns "" if
     there's nothing to work from or the call fails."""
@@ -310,7 +387,8 @@ def summarize_topic(groq_client, model: str, place: str, topic: str,
     prompt = (
         f"Write a clear, factual summary about the {topic} of {place}. "
         "Use ONLY the information below — do not invent facts. Aim for 3-6 sentences. "
-        "If the information is thin, say what is known and note the rest is unclear.\n\n"
+        "If the information is thin, say what is known and note the rest is unclear.\n"
+        f"Write the summary in {lang}.\n\n"
         f"{context}\n\nSummary:"
     )
     try:
@@ -332,12 +410,16 @@ def fetch_area_news(
     serper_api_key: str = "",
     max_results: int = 10,
     timeout: float = 20.0,
+    time_filter: str = "",
 ) -> list[dict]:
     """Recent news for an area.
 
     Uses Serper's Google News endpoint when ``serper_api_key`` is set, otherwise
     (or on failure) falls back to DuckDuckGo news (no key). Each item is
     normalized to ``{title, url, source, date, snippet}``.
+
+    ``time_filter`` limits recency: "" (any time), "d" (24h), "w" (week),
+    "m" (month).
     """
     if not area.strip():
         return []
@@ -345,10 +427,13 @@ def fetch_area_news(
 
     if serper_api_key:
         try:
+            payload = {"q": query, "num": max_results}
+            if time_filter in ("d", "w", "m"):
+                payload["tbs"] = f"qdr:{time_filter}"
             resp = httpx.post(
                 "https://google.serper.dev/news",
                 headers={"X-API-KEY": serper_api_key, "Content-Type": "application/json"},
-                json={"q": query, "num": max_results},
+                json=payload,
                 timeout=timeout,
             )
             resp.raise_for_status()
@@ -373,8 +458,11 @@ def fetch_area_news(
     try:
         from ddgs import DDGS
 
+        kw = {"max_results": max_results}
+        if time_filter in ("d", "w", "m"):
+            kw["timelimit"] = time_filter
         with DDGS() as ddgs:
-            results = list(ddgs.news(query, max_results=max_results))
+            results = list(ddgs.news(query, **kw))
         return [
             {
                 "title": r.get("title", ""),
@@ -393,7 +481,8 @@ def fetch_area_news(
 # --------------------------------------------------------------------------- #
 # Optional: short AI summary of an area's headlines
 # --------------------------------------------------------------------------- #
-def summarize_news(groq_client, model: str, area: str, items: list[dict]) -> str:
+def summarize_news(groq_client, model: str, area: str, items: list[dict],
+                   lang: str = "English") -> str:
     """A concise digest of the area's news, consolidating many publications into
     one place. Returns "" if there is nothing to summarize or the call fails."""
     if not items:
@@ -408,7 +497,8 @@ def summarize_news(groq_client, model: str, area: str, items: list[dict]) -> str
         "bullet points) that consolidates them into one place, so the reader does "
         "not have to open every article. Lead with the most important development; "
         "group related items; keep it neutral and factual. Use ONLY these "
-        "headlines — do not invent details.\n\n"
+        "headlines — do not invent details.\n"
+        f"Write the digest in {lang}.\n\n"
         f"{lines}\n\nConcise news digest:"
     )
     try:
