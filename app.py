@@ -18,6 +18,12 @@ os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault(
     "HF_HOME", os.path.join(os.path.dirname(os.path.abspath(__file__)), ".hf-cache")
 )
+# Same for the Playwright browsers used by the Deep-dive scraper — they live in
+# the project's .pw-browsers, so point Playwright there no matter how it's
+# launched (otherwise Deep dive fails with "browser executable not found").
+_PW_BROWSERS = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".pw-browsers")
+if os.path.isdir(_PW_BROWSERS):
+    os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", _PW_BROWSERS)
 
 import streamlit as st
 from groq import Groq
@@ -342,20 +348,46 @@ def _render_news(data, sel, api_key, model, serper_api_key):
                 st.divider()
 
     if api_key.strip() and st.button("🔬 Deep dive — cited summary of this area"):
-        config = ScraperConfig(model=model.strip(), serper_api_key=serper_api_key.strip())
+        # Tuned for SPEED: one search round, few pages, short page timeout. The
+        # full default pipeline (3 rounds × 10 pages × 15s) is what made it slow.
+        config = ScraperConfig(
+            model=model.strip(),
+            serper_api_key=serper_api_key.strip(),
+            max_searches=1,        # no re-query loop
+            max_results=4,         # scrape only the top few pages
+            page_timeout_ms=8000,  # don't wait on slow pages
+            first_stage_k=15,
+            pdf_max_pages=8,
+        )
         emb = get_embedding_model(config.embedding_model_name)
         rer = get_reranker(config.reranker_model_name) if config.reranker_model_name else None
         agent = ResearchAgent(Groq(api_key=api_key.strip()), emb, config, reranker=rer)
-        try:
-            with st.spinner("Running deep research on this area…"):
-                result = agent.research(f"latest news about {subject}")
-        except Exception as exc:  # match the graceful handling of the main RAG flow
-            st.error(f"Deep dive failed ({type(exc).__name__}). Please try again.")
-            result = {}
-        st.markdown(result.get("answer") or "_No answer was produced._")
-        score = result.get("confidence_score")
-        if score is not None:
-            st.caption(f"Confidence score {score:.2f}")
+
+        merged, failed = {}, False
+        # Stream the steps live so progress is visible instead of one long spinner.
+        with st.status("Running deep research… (~15–30s)", expanded=True) as status:
+            try:
+                for kind, payload in agent.stream_research(f"latest news about {subject}"):
+                    if kind == "error":
+                        failed = True
+                        status.update(label="Deep dive failed", state="error")
+                        break
+                    node, node_state = next(iter(payload.items()))
+                    merged.update(node_state)
+                    status.write(STEP_LABELS.get(node, node))
+                if not failed:
+                    status.update(label="Done", state="complete")
+            except Exception:  # graceful, like the main RAG flow
+                failed = True
+                status.update(label="Deep dive failed", state="error")
+
+        if failed:
+            st.error("Deep dive couldn't finish. Please try again.")
+        else:
+            st.markdown(merged.get("answer") or "_No answer was produced._")
+            score = merged.get("confidence_score")
+            if score is not None:
+                st.caption(f"Confidence score {score:.2f}")
 
 
 def _render_weather(data, sel):
