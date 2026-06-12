@@ -72,6 +72,14 @@ KNOWLEDGE_TOPICS = {
     "👥 Demographics": "demographics, population, languages and religion",
     "🏛️ Government": "government, administration and local governance",
     "🚆 Transport": "transport, airport, railways and road connectivity",
+    "🎭 Culture": "culture, traditions, festivals, cuisine and the arts",
+    "🌱 Agriculture": "agriculture, main crops, farming and irrigation",
+    "🏭 Industry": "industries, manufacturing and major businesses",
+    "🌳 Environment": "environment, climate, biodiversity and conservation",
+    "🏥 Healthcare": "healthcare, hospitals and medical facilities",
+    "🔬 Science & Technology": "science, technology, research and innovation",
+    "⚽ Sports": "sports, athletes and sporting facilities",
+    "📈 Development": "development, infrastructure projects and economic growth",
 }
 
 # Dropdown order (News / Geography / Weather first, then the knowledge topics,
