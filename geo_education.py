@@ -17,13 +17,27 @@ fact-check) is the pipeline you already have.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Optional
 
 from geopy.geocoders import Nominatim
 from geopy.extra.rate_limiter import RateLimiter
+from groq import InternalServerError, RateLimitError
 
-from scraper import ResearchAgent
+from news_map import web_search
+
+
+def groq_complete(client, *, retries: int = 4, base_delay: float = 2.0, **kwargs):
+    """``client.chat.completions.create`` with exponential backoff on Groq rate
+    limits / 5xx, so the student UI doesn't fail on a transient RateLimitError."""
+    for attempt in range(retries):
+        try:
+            return client.chat.completions.create(**kwargs)
+        except (RateLimitError, InternalServerError):
+            if attempt == retries - 1:
+                raise
+            time.sleep(base_delay * (2 ** attempt))
 
 
 # The physical / environmental layers scientists use to analyse a region. Each
@@ -81,13 +95,17 @@ def reverse_geocode(lat: float, lon: float, *, language: str = "en") -> PlaceInf
             is_water=True,
         )
     addr = (loc.raw or {}).get("address", {})
-    parts = [
+    locality = (
         addr.get("city") or addr.get("town") or addr.get("village")
-        or addr.get("county") or addr.get("suburb"),
-        addr.get("state"),
-        addr.get("country"),
-    ]
-    name = ", ".join(p for p in parts if p) or loc.address
+        or addr.get("county") or addr.get("state_district") or addr.get("suburb") or ""
+    )
+    state = addr.get("state") or ""
+    country = addr.get("country") or ""
+    # Keep names short and student-friendly: "Bhopal, Madhya Pradesh".
+    if locality and state:
+        name = f"{locality}, {state}"
+    else:
+        name = ", ".join(p for p in (locality, state, country) if p) or loc.address
     return PlaceInfo(lat=lat, lon=lon, name=name, raw=loc.raw or {})
 
 
@@ -116,26 +134,105 @@ def build_student_query(place: PlaceInfo, grade: int) -> str:
     )
 
 
-def explain_location(
-    agent: ResearchAgent,
-    lat: float,
-    lon: float,
+def synthesize_geography(
+    client,
+    model: str,
+    place: PlaceInfo,
     grade: int,
     *,
-    language: str = "en",
+    serper_api_key: str = "",
+    max_results: int = 8,
 ) -> dict:
-    """End-to-end (blocking): coordinate -> place -> grade-tailored research dict.
+    """FAST path: web-search snippets -> Groq writes a grade-tailored, layered,
+    cited geography explainer. No scraping / embeddings / FAISS, so it answers in
+    roughly one search + one LLM call instead of the full LangGraph pipeline.
 
-    Returns the pipeline's merged final state (``answer``, ``urls``,
-    ``confidence``, ``retrieved_chunks``, ...) plus ``place``, ``grade`` and the
-    ``student_question`` that was asked. For live UI progress, call
-    ``reverse_geocode`` + ``build_student_query`` yourself and drive
-    ``agent.stream_research(question)`` (see geo_app.py).
+    Search uses Serper (Google) when ``serper_api_key`` is set and otherwise falls
+    back to DuckDuckGo automatically (``news_map.web_search``). Returns
+    ``{answer, sources, snippets, student_question}``.
     """
-    place = reverse_geocode(lat, lon, language=language)
+    queries = [
+        f"{place.name} geography climate rivers landforms",
+        f"{place.name} physical features soil terrain elevation natural resources",
+    ]
+    seen: set[str] = set()
+    snippets: list[dict] = []
+    for q in queries:
+        for s in web_search(q, serper_api_key=serper_api_key, max_results=max_results):
+            url = s.get("url", "")
+            if url and url not in seen:
+                seen.add(url)
+                snippets.append(s)
+
     question = build_student_query(place, grade)
-    result = agent.research(question)
-    result["place"] = place
-    result["grade"] = grade
-    result["student_question"] = question
-    return result
+    snippets = snippets[:8]  # keep the prompt small -> faster, fewer rate limits
+    blocks = [
+        f"[{i}] {s.get('title', '')}: {(s.get('snippet', '') or '')[:280]}"
+        for i, s in enumerate(snippets, 1)
+    ]
+    context = "\n".join(blocks) if blocks else "(no search results)"
+    band = (
+        "very simple words and short sentences, and explain any hard word in brackets"
+        if grade <= 7
+        else "clear, simple language, explaining a technical term the first time you use it"
+    )
+    prompt = (
+        f"You are a friendly geography teacher writing for a class {grade} student in "
+        f"India. Write a short, engaging geography profile of {place.name}.\n"
+        f"Structure:\n"
+        f"- Start with ONE sentence on where it is and what it is.\n"
+        f"- Then describe its geography warmly, using short **bold** mini-headings ONLY "
+        f"for aspects you can actually describe — choose from: Location, Landscape & "
+        f"Landforms, Climate & Weather, Soil, Water (rivers / lakes / sea), Natural "
+        f"Events (like floods or erosion).\n"
+        f"- End with 2-3 fun facts a student would enjoy.\n\n"
+        f"RULES:\n"
+        f"- Prefer the numbered SOURCES; put a citation like [1] after a fact taken "
+        f"from them.\n"
+        f"- You MAY add basic, well-known geography to keep it clear and complete, but "
+        f"do NOT invent specific numbers, dates or named claims.\n"
+        f"- NEVER write that information is missing, unavailable, or not in the sources "
+        f"— simply leave out what you do not know, and skip any mini-heading you cannot "
+        f"fill with real content.\n"
+        f"- Write {band}. Keep it suitable for an 11-16 year old: avoid politics, "
+        f"violence, religious disputes and casualty details.\n\n"
+        f"SOURCES:\n{context}\n\nWrite the profile:"
+    )
+    answer = ""
+    if snippets:
+        try:
+            resp = groq_complete(
+                client, model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3, max_tokens=900,
+            )
+            answer = (resp.choices[0].message.content or "").strip()
+        except Exception:
+            answer = ""
+
+    if not answer:
+        # Fallback: write from the model's own geography knowledge so the student
+        # always gets a profile, even if search/synthesis was thin or rate-limited.
+        fb = (
+            f"Write a short, friendly geography profile of {place.name} for a class "
+            f"{grade} student in India. Cover where it is, its landscape and landforms, "
+            f"its climate, and nearby water (rivers, lakes or sea), then end with 2 fun "
+            f"facts. Use {band}. Keep it factual and simple; avoid politics, violence "
+            f"and casualty details."
+        )
+        try:
+            resp = groq_complete(
+                client, model=model,
+                messages=[{"role": "user", "content": fb}],
+                temperature=0.4, max_tokens=700,
+            )
+            answer = (resp.choices[0].message.content or "").strip()
+        except Exception:
+            answer = ""
+
+    return {
+        "answer": answer,
+        "sources": [s["url"] for s in snippets if s.get("url")],
+        "snippets": snippets,
+        "student_question": question,
+    }

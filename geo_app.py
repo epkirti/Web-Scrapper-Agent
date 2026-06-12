@@ -6,9 +6,11 @@ Run with:
 
 Mode is exclusive: in "Search" mode the map tap is disabled; in "Tap" mode the
 search bar is disabled. Either way the chosen location is turned into a
-class-tailored question and answered by the existing agentic web-research
-pipeline (scraper.py), unchanged. The map is served with streamlit-folium and
-the result marker carries a tappable flyer (popup).
+grade-tailored geography explainer via a FAST path — Serper/DuckDuckGo search
+snippets synthesised by Groq (no scraping / embeddings / FAISS) — plus local
+news. The map is served with streamlit-folium; the result marker carries a
+tappable flyer (popup). Only Groq + Serper APIs are used (DuckDuckGo is the
+keyless search fallback).
 """
 
 import os
@@ -26,44 +28,31 @@ import folium
 import streamlit as st
 from streamlit_folium import st_folium
 from groq import Groq
-from sentence_transformers import CrossEncoder, SentenceTransformer
-from geopy.geocoders import Nominatim
 
-from scraper import ResearchAgent, ScraperConfig, STEP_LABELS
-from geo_education import PlaceInfo, reverse_geocode, build_student_query
+from geo_education import (
+    PlaceInfo, reverse_geocode, synthesize_geography, groq_complete,
+)
+from news_map import fetch_area_news, forward_geocode
 
 st.set_page_config(page_title="Geo Explorer for Students", page_icon="🗺️", layout="wide")
 
-GROQ_MODEL = "llama-3.3-70b-versatile"
+GROQ_MODEL = "llama-3.1-8b-instant"  # high TPM + fast — avoids 70B free-tier rate limits
 
 
 # --------------------------------------------------------------------------- #
 # Cached heavy resources
 # --------------------------------------------------------------------------- #
-@st.cache_resource(show_spinner="Loading embedding model…")
-def get_embedding_model(name: str) -> SentenceTransformer:
-    return SentenceTransformer(name)
-
-
-@st.cache_resource(show_spinner="Loading reranker model…")
-def get_reranker(name: str) -> CrossEncoder:
-    return CrossEncoder(name, max_length=512)
-
-
-@st.cache_resource
-def get_forward_geocoder() -> Nominatim:
-    return Nominatim(user_agent="geo-edu-classroom")
-
-
 def _chat_context(merged: dict, max_chars: int = 4000) -> str:
     """Ground the chatbot in what the pipeline already gathered for this place."""
     parts = []
     answer = (merged.get("answer") or "").strip()
     if answer:
         parts.append("SUMMARY:\n" + answer)
-    chunks = merged.get("retrieved_chunks") or []
-    if chunks:
-        parts.append("SOURCE NOTES:\n" + "\n\n".join(str(c) for c in chunks))
+    snippets = merged.get("snippets") or []
+    if snippets:
+        parts.append("SOURCE NOTES:\n" + "\n\n".join(
+            f"{s.get('title', '')}: {s.get('snippet', '')}" for s in snippets
+        ))
     return "\n\n".join(parts)[:max_chars]
 
 
@@ -82,8 +71,8 @@ def _chat_reply(client, grade: int, place_name: str, context: str, history: list
         f"disputes, and any casualty or disaster-death details.\n\nCONTEXT:\n{context}"
     )
     messages = [{"role": "system", "content": system}, *history[-8:]]
-    resp = client.chat.completions.create(
-        model=GROQ_MODEL, messages=messages, temperature=0.3, max_tokens=600,
+    resp = groq_complete(
+        client, model=GROQ_MODEL, messages=messages, temperature=0.3, max_tokens=600,
     )
     return resp.choices[0].message.content or ""
 
@@ -115,8 +104,8 @@ def _generate_quiz(
         '{"questions":[{"question":"...","options":["a","b","c","d"],"answer":0,'
         '"why":"one-line reason"}]}\n\nCONTEXT:\n' + context
     )
-    resp = client.chat.completions.create(
-        model=GROQ_MODEL, messages=[{"role": "user", "content": prompt}],
+    resp = groq_complete(
+        client, model=GROQ_MODEL, messages=[{"role": "user", "content": prompt}],
         temperature=0.9, top_p=0.95, max_tokens=900, response_format={"type": "json_object"},
     )
     raw = resp.choices[0].message.content or "{}"
@@ -142,6 +131,84 @@ def _generate_quiz(
                 "why": str(q.get("why", "")),
             })
     return quiz
+
+
+def _make_quiz(api_key: str, grade: int, place_name: str, context: str) -> None:
+    """Generate one quiz round and store it in session (used by Generate / New quiz /
+    Try again), so those buttons produce a fresh quiz directly instead of resetting."""
+    try:
+        quiz = _generate_quiz(
+            Groq(api_key=api_key), grade, place_name, context,
+            round_no=st.session_state.get("quiz_round", 1),
+            avoid=st.session_state.get("quiz_seen", []),
+        )
+        st.session_state["quiz"] = quiz
+        st.session_state["quiz_seen"] = (
+            st.session_state.get("quiz_seen", []) + [q["question"] for q in quiz]
+        )
+        st.session_state["quiz_error"] = ""
+    except Exception as exc:
+        st.session_state["quiz"] = []
+        st.session_state["quiz_error"] = type(exc).__name__
+
+
+def _kidsafe_news_summary(client, area: str, items: list, grade: int) -> str:
+    """A short, kid-safe, grade-appropriate summary of area headlines (Groq only)."""
+    lines = "\n".join(
+        f"- {it.get('title', '')} ({it.get('source', '')}): {it.get('snippet', '')}"
+        for it in items[:10]
+    )
+    prompt = (
+        f"Here are recent news headlines about {area}. Write a short, neutral, 2-4 "
+        f"sentence summary for a class {grade} student in simple language. Use ONLY "
+        f"these headlines; do not invent details. Focus on geography, weather, "
+        f"environment, science and community. Skip anything about violence, crime, "
+        f"death, accidents or politics. If nothing is school-appropriate, say there "
+        f"is no school-friendly local news right now.\n\n{lines}\n\nSummary:"
+    )
+    try:
+        resp = groq_complete(
+            client, model=GROQ_MODEL, messages=[{"role": "user", "content": prompt}],
+            temperature=0.2, max_tokens=300,
+        )
+        return (resp.choices[0].message.content or "").strip()
+    except Exception:
+        return ""
+
+
+def _fetch_area_news(place, serper_key: str, api_key: str, grade: int) -> dict:
+    """Area news via news_map's Serper/DDG search + a kid-safe Groq summary.
+
+    Uses ONLY Serper (search) and Groq (summary) — no other external APIs.
+    """
+    info: dict = {"news": [], "news_summary": ""}
+    try:
+        info["news"] = fetch_area_news(place.name, serper_api_key=serper_key, max_results=8)
+    except Exception:
+        info["news"] = []
+    if info["news"] and api_key:
+        info["news_summary"] = _kidsafe_news_summary(
+            Groq(api_key=api_key), place.name, info["news"], grade
+        )
+    return info
+
+
+def _render_area_news(info: dict) -> None:
+    news = (info or {}).get("news") or []
+    summary = (info or {}).get("news_summary") or ""
+    if not news and not summary:
+        return
+    st.divider()
+    st.subheader("📰 Local news for this area")
+    if summary:
+        st.markdown(f"**🗞️ Student-friendly summary:** {summary}")
+    if news:
+        with st.expander(f"🔗 Recent headlines ({len(news)})"):
+            for it in news:
+                title = it.get("title", "")
+                url = it.get("url", "")
+                meta = " · ".join(x for x in (it.get("source", ""), it.get("date", "")) if x)
+                st.markdown(f"- [{title}]({url})" + (f"  \n  _{meta}_" if meta else ""))
 
 
 def _flyer_html(place_name: str, grade: int, answer: str | None) -> str:
@@ -171,10 +238,7 @@ with st.sidebar:
         help="Free key at https://serper.dev for Google results. Blank → DuckDuckGo.",
     )
     language = st.selectbox("Place-name language", ["en", "hi"], index=0)
-    with st.expander("Research depth"):
-        max_searches = st.slider("Max research rounds", 1, 6, 3)
-        verify_answer = st.checkbox("Fact-check pass", value=True)
-        rerank = st.checkbox("Cross-encoder reranking", value=True)
+    st.caption("⚡ Fast mode: Serper/DuckDuckGo search → Groq synthesis (Groq + Serper only).")
 
 
 # --------------------------------------------------------------------------- #
@@ -226,19 +290,19 @@ target = None  # {"sig", "lat", "lon", "place"|None}
 
 if is_search and search and search_text.strip():
     q = search_text.strip()
-    try:
-        loc = get_forward_geocoder().geocode(q, language="en", timeout=10)
-    except Exception:
-        loc = None
-    if loc is not None:
-        st.session_state["center"] = [loc.latitude, loc.longitude]
+    geo = forward_geocode(q)  # news_map: coords + clean area, no API key
+    if geo:
+        lat, lon = geo["lat"], geo["lon"]
+        # Keep the student's typed subject as the title (e.g. "Statue of Liberty",
+        # "Western Ghats") rather than the full OSM address.
+        st.session_state["center"] = [lat, lon]
         st.session_state["zoom"] = 9
-        place = PlaceInfo(lat=loc.latitude, lon=loc.longitude, name=loc.address, raw=loc.raw or {})
+        place = PlaceInfo(lat=lat, lon=lon, name=q, raw=geo)
         st.session_state["marker"] = {
-            "lat": loc.latitude, "lon": loc.longitude, "label": loc.address,
-            "popup": _flyer_html(loc.address, int(grade), None),
+            "lat": lat, "lon": lon, "label": q,
+            "popup": _flyer_html(q, int(grade), None),
         }
-        target = {"sig": f"q:{loc.latitude:.5f},{loc.longitude:.5f}", "place": place}
+        target = {"sig": f"q:{lat:.5f},{lon:.5f}", "place": place}
     else:
         # Not a mappable place (e.g. a topic) — research the raw text by name.
         st.session_state["marker"] = None
@@ -295,33 +359,23 @@ if target and target["sig"] != st.session_state["last_sig"]:
             with st.spinner("Finding this place…"):
                 place = reverse_geocode(target["lat"], target["lon"], language=language)
 
-        question = build_student_query(place, int(grade))
+        client = Groq(api_key=api_key.strip())
+        with st.spinner(f"Researching {place.name}…"):
+            synth = synthesize_geography(
+                client, GROQ_MODEL, place, int(grade),
+                serper_api_key=serper_api_key.strip(),
+            )
+            area_news = _fetch_area_news(place, serper_api_key.strip(), api_key.strip(), int(grade))
 
-        config = ScraperConfig(
-            model=GROQ_MODEL,
-            serper_api_key=serper_api_key.strip(),
-            max_searches=int(max_searches),
-            rerank=bool(rerank),
-            verify_answer=bool(verify_answer),
-        )
-        embedding_model = get_embedding_model(config.embedding_model_name)
-        reranker = get_reranker(config.rerank_model_name) if config.rerank else None
-        agent = ResearchAgent(Groq(api_key=api_key.strip()), embedding_model, config, reranker=reranker)
-
-        merged: dict = {}
-        with st.status(f"Researching {place.name}…", expanded=True) as status:
-            for kind, payload in agent.stream_research(question):
-                if kind == "error":
-                    status.update(label="Research failed", state="error")
-                    st.exception(payload)
-                    st.stop()
-                node, node_state = next(iter(payload.items()))
-                merged.update(node_state)
-                st.write(STEP_LABELS.get(node, node))
-            status.update(label="Done", state="complete")
-
+        merged = {
+            "answer": synth.get("answer", ""),
+            "urls": synth.get("sources", []),
+            "snippets": synth.get("snippets", []),
+        }
         st.session_state["result"] = {
-            "place": place, "grade": int(grade), "question": question, "merged": merged,
+            "place": place, "grade": int(grade),
+            "question": synth.get("student_question", ""), "merged": merged,
+            "area_news": area_news,
         }
         # Enrich the marker flyer with a snippet, then rerun so it shows on the map.
         if not getattr(place, "is_water", False) or (place.lat or place.lon):
@@ -345,13 +399,9 @@ st.subheader(f"📚 {place.name} — for Class {res['grade']}")
 if getattr(place, "is_water", False):
     st.caption("This point is on water / an unnamed area — researching the surrounding region.")
 
-confidence = (merged.get("confidence") or "").lower()
-if confidence == "high":
-    st.success("🟢 High confidence — corroborated by multiple independent sources.")
-elif confidence == "medium":
-    st.warning("🟡 Medium confidence — supported, but mostly single-source.")
-
 st.markdown(merged.get("answer") or "_No answer was produced._")
+
+_render_area_news(res.get("area_news"))
 
 urls = merged.get("urls") or []
 with st.expander(f"🔗 Sources ({len(urls)})"):
@@ -359,7 +409,7 @@ with st.expander(f"🔗 Sources ({len(urls)})"):
         for u in urls:
             st.markdown(f"- [{u}]({u})")
     else:
-        st.write("No sources were scraped.")
+        st.write("No sources found.")
 
 with st.expander("🧪 The exact question asked (grade-tailored)"):
     st.write(res["question"])
@@ -384,27 +434,16 @@ if st.session_state.get("quiz") is None:
             st.error("Please enter your Groq API key in the sidebar to generate a quiz.")
         else:
             with st.spinner("Writing quiz questions…"):
-                try:
-                    quiz = _generate_quiz(
-                        Groq(api_key=api_key.strip()), res["grade"], place.name,
-                        _chat_context(merged),
-                        round_no=st.session_state.get("quiz_round", 1),
-                        avoid=st.session_state.get("quiz_seen", []),
-                    )
-                    st.session_state["quiz"] = quiz
-                    st.session_state["quiz_seen"] = (
-                        st.session_state.get("quiz_seen", []) + [q["question"] for q in quiz]
-                    )
-                except Exception as exc:
-                    st.session_state["quiz"] = []
-                    st.error(f"Couldn't generate a quiz ({type(exc).__name__}).")
+                _make_quiz(api_key.strip(), res["grade"], place.name, _chat_context(merged))
             st.rerun()
 else:
     quiz = st.session_state["quiz"]
     if not quiz:
-        st.info("No quiz could be made from the gathered information yet.")
-        if st.button("Try again"):
-            st.session_state["quiz"] = None
+        err = st.session_state.get("quiz_error")
+        st.info("Couldn't make a quiz right now" + (f" ({err})." if err else "."))
+        if st.button("🔄 Try again"):
+            with st.spinner("Writing quiz questions…"):
+                _make_quiz(api_key.strip(), res["grade"], place.name, _chat_context(merged))
             st.rerun()
     else:
         rnd = st.session_state.get("quiz_round", 1)
@@ -434,7 +473,8 @@ else:
 
         if st.button("🔄 New quiz"):
             st.session_state["quiz_round"] = rnd + 1
-            st.session_state["quiz"] = None
+            with st.spinner("Writing a new quiz…"):
+                _make_quiz(api_key.strip(), res["grade"], place.name, _chat_context(merged))
             st.rerun()
 
 
