@@ -16,3 +16,6 @@ numpy<2
 transformers<5
 trafilatura          # boilerplate-free article extraction (accuracy upgrade)
 rank-bm25            # lexical half of the hybrid (FAISS + BM25) retriever
+folium               # Leaflet map for the class 6-10 Geo Explorer (geo_app.py)
+streamlit-folium     # captures map-click lat/lon inside Streamlit
+geopy                # reverse-geocode clicked coordinates via OSM Nominatim

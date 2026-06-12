@@ -18,6 +18,13 @@ dist/
 *.pkl
 .cache/
 
+# Persistent Chrome profile used by the browser-driven fetchers
+# (google_ai_overview.py). Contains cookies, logins and caches — NEVER commit.
+.chrome-profile/
+
+# Debug screenshots saved by the AI-overview fetcher (debug=True)
+ai_overview_debug.png
+
 # OS / editor noise
 .DS_Store
 .idea/
