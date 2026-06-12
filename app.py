@@ -28,7 +28,7 @@ from google_ai_overview import fetch_ai_overview_sync
 from news_map import (
     reverse_geocode, forward_geocode, fetch_area_news, summarize_news,
     fetch_weather, fetch_elevation, fetch_wikipedia_summary,
-    web_search, summarize_topic,
+    web_search, summarize_topic, HFChatClient, HF_MODEL,
 )
 
 # Persistent Chrome profile for the Quick-answer fetcher. Reusing it across runs
@@ -267,6 +267,8 @@ def _get_category_data(category, sel, api_key, model, serper_api_key, news_count
 
     lat, lon = sel["lat"], sel["lon"]
     place = sel.get("area", "")
+    hf = st.session_state.get("hf_token", "").strip()       # HF token for summaries
+    hf_model = st.session_state.get("hf_model", HF_MODEL)
     if category.endswith("News"):
         subject = _news_subject(sel)
         items = fetch_area_news(subject, serper_api_key=serper_api_key, max_results=news_count)
@@ -276,8 +278,8 @@ def _get_category_data(category, sel, api_key, model, serper_api_key, news_count
             if len(city_items) > len(items):
                 items, subject = city_items, place
         summary = ""
-        if do_summary and items and api_key.strip():
-            summary = summarize_news(Groq(api_key=api_key.strip()), model.strip(), subject, items)
+        if do_summary and items and hf:
+            summary = summarize_news(HFChatClient(token=hf, model=hf_model), model.strip(), subject, items)
         data = {"items": items, "summary": summary, "subject": subject}
     elif "Weather" in category:
         data = fetch_weather(lat, lon)
@@ -287,9 +289,9 @@ def _get_category_data(category, sel, api_key, model, serper_api_key, news_count
         topic = KNOWLEDGE_TOPICS[category]
         snippets = web_search(f"{place} {topic}", serper_api_key=serper_api_key, max_results=6)
         summary = ""
-        if api_key.strip() and (snippets or place):
+        if hf and (snippets or place):
             wiki = fetch_wikipedia_summary(sel.get("locality") or place.split(",")[0])
-            summary = summarize_topic(Groq(api_key=api_key.strip()), model.strip(),
+            summary = summarize_topic(HFChatClient(token=hf, model=hf_model), model.strip(),
                                       place, topic, snippets, wiki.get("extract", ""))
         data = {"summary": summary, "sources": snippets}
     else:  # Overview
@@ -301,9 +303,9 @@ def _get_category_data(category, sel, api_key, model, serper_api_key, news_count
     # Only cache results that actually carry content, so a transient network
     # failure (empty result) is retried next time rather than sticking.
     cacheable = bool(data) and (not isinstance(data, dict) or any(data.values()))
-    # If a key is set but the AI summary/digest came back empty despite having
+    # If a token is set but the AI summary/digest came back empty despite having
     # material (a transient LLM failure), don't cache — so re-viewing retries it.
-    if api_key.strip() and not (data or {}).get("summary"):
+    if hf and not (data or {}).get("summary"):
         if category in KNOWLEDGE_TOPICS and (data or {}).get("sources"):
             cacheable = False
         elif category.endswith("News") and (data or {}).get("items"):
@@ -323,8 +325,8 @@ def _render_news(data, sel, api_key, model, serper_api_key):
     # Concise digest first: the consolidated "everything in one place" view.
     if summary:
         st.info(f"**📋 In short**\n\n{summary}")
-    elif items and not api_key.strip():
-        st.caption("🔑 Add a Groq API key in the sidebar for a concise digest of the headlines below.")
+    elif items and not st.session_state.get("hf_token", "").strip():
+        st.caption("🔑 Add a Hugging Face API token in the sidebar for a concise digest of the headlines below.")
 
     if not items:
         st.warning("No news found for this area. Try a nearby point or a larger place.")
@@ -413,8 +415,8 @@ def _render_topic(category, data, sel, api_key, serper_api_key):
         # No AI summary (no Groq key, or the model call failed/returned nothing) —
         # still show readable content by surfacing the source snippets themselves,
         # so the topic is never just a list of bare links.
-        if not api_key.strip():
-            st.caption("🔑 Add a Groq API key in the sidebar for a written summary. "
+        if not st.session_state.get("hf_token", "").strip():
+            st.caption("🔑 Add a Hugging Face API token in the sidebar for a written summary. "
                        "Here's what the sources say:")
         else:
             st.caption("Here's what the sources say:")
@@ -530,8 +532,9 @@ def _render_area_chat(sel: dict, api_key: str, model: str, serper_api_key: str) 
 
     # Only show the input once a key is present — a persistent note otherwise
     # (a transient on-submit warning would just flash and vanish on the next rerun).
-    if not api_key.strip():
-        st.info("🔑 Add a Groq API key in the sidebar to chat about this place.")
+    hf = st.session_state.get("hf_token", "").strip()
+    if not hf:
+        st.info("🔑 Add a Hugging Face API token in the sidebar to chat about this place.")
         return
 
     user_q = st.chat_input(f"e.g. What is {place} famous for? Best time to visit?")
@@ -548,11 +551,12 @@ def _render_area_chat(sel: dict, api_key: str, model: str, serper_api_key: str) 
                 snippets = web_search(f"{place} {user_q}", serper_api_key=serper_api_key, max_results=5)
                 context = _area_chat_context(sel, snippets)
                 reply = _area_chat_reply(
-                    Groq(api_key=api_key.strip()), model.strip(), place, context,
-                    st.session_state["area_chat"],
+                    HFChatClient(token=hf, model=st.session_state.get("hf_model", HF_MODEL)),
+                    model.strip(), place, context, st.session_state["area_chat"],
                 )
             except Exception as exc:  # surfaced, never crashes the chat
-                reply = f"Sorry, I couldn't answer that just now ({type(exc).__name__})."
+                reply = (f"Sorry, I couldn't answer that just now.\n\n"
+                         f"`{type(exc).__name__}: {str(exc)[:300]}`")
         st.markdown(reply)
 
     st.session_state["area_chat"].append({"role": "assistant", "content": reply})
@@ -582,6 +586,22 @@ with st.sidebar:
         help="Get one at https://console.groq.com/keys",
     )
     model = st.text_input("Groq model", value="llama-3.3-70b-versatile")
+
+    hf_token = st.text_input(
+        "Hugging Face API token",
+        type="password",
+        value=os.getenv("HF_TOKEN", "") or os.getenv("HUGGINGFACEHUB_API_TOKEN", ""),
+        help="From https://huggingface.co/settings/tokens — powers the Area Explorer summaries & chat.",
+    )
+    hf_model = st.text_input(
+        "Hugging Face model",
+        value=os.getenv("HF_MODEL", HF_MODEL),
+        help="Must be served by HF Inference Providers. Gated models (meta-llama/*) "
+             "need their license accepted on HF or inference returns 403; "
+             "Qwen/Qwen2.5-7B-Instruct is open and works out of the box.",
+    )
+    st.session_state["hf_token"] = hf_token
+    st.session_state["hf_model"] = hf_model.strip() or HF_MODEL
 
     if mode == RAG_MODE:
         embedding_model_name = st.text_input("Embedding model", value="all-MiniLM-L6-v2")

@@ -12,6 +12,7 @@ sentence-transformers
 faiss-cpu
 langchain-text-splitters
 groq
+huggingface-hub            # Llama-2 (meta-llama/Llama-2-7b-chat-hf) via HF Inference API
 pypdf
 httpx
 numpy<2

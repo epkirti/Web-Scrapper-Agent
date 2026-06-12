@@ -15,8 +15,69 @@ from typing import Optional
 from urllib.parse import quote
 
 import httpx
+from huggingface_hub import InferenceClient
 
 _UA = {"User-Agent": "area-explorer/1.0 (research assistant)"}
+
+
+# --------------------------------------------------------------------------- #
+# LLM backend — Hugging Face Inference API, exposed as a Groq-compatible client
+# --------------------------------------------------------------------------- #
+# Model notes for the HF Inference API:
+#  - meta-llama/Llama-2-7b-chat-hf is NOT served by any provider -> StopIteration.
+#  - Gated models (meta-llama/*) need their license accepted on HF, else 403
+#    (HfHubHTTPError) at inference time.
+#  - Qwen/Qwen2.5-7B-Instruct is OPEN (no gate) and broadly served -> safe default.
+# Overridable from the app sidebar.
+HF_MODEL = "Qwen/Qwen2.5-7B-Instruct"
+
+
+class _HFMessage:
+    def __init__(self, content: str):
+        self.content = content
+
+
+class _HFChoice:
+    def __init__(self, content: str):
+        self.message = _HFMessage(content)
+
+
+class _HFResponse:
+    def __init__(self, content: str):
+        self.choices = [_HFChoice(content)]
+
+
+class _HFCompletions:
+    def __init__(self, client: "InferenceClient", model: str):
+        self._client, self._model = client, model
+
+    def create(self, *, messages, model=None, temperature=0.7, max_tokens=512, **_):
+        out = self._client.chat_completion(
+            messages=messages,
+            model=self._model,
+            temperature=max(float(temperature or 0.0), 0.01),  # HF rejects temp=0
+            max_tokens=int(max_tokens or 512),
+        )
+        return _HFResponse(out.choices[0].message.content or "")
+
+
+class _HFChat:
+    def __init__(self, client: "InferenceClient", model: str):
+        self.completions = _HFCompletions(client, model)
+
+
+class HFChatClient:
+    """Groq/OpenAI-compatible chat client backed by the Hugging Face Inference API.
+
+    Exposes ``.chat.completions.create(messages=..., temperature=..., max_tokens=...)``
+    so existing Groq call sites keep working unchanged. The per-call ``model`` is
+    ignored — the configured HF model (default ``meta-llama/Llama-2-7b-chat-hf``) is
+    used. Needs an HF API token with access to the (gated) model.
+    """
+
+    def __init__(self, token: str, model: str = HF_MODEL):
+        self._client = InferenceClient(token=token or None)
+        self.chat = _HFChat(self._client, model)
 
 
 # --------------------------------------------------------------------------- #
