@@ -17,7 +17,11 @@ from sentence_transformers import SentenceTransformer, CrossEncoder
 
 from scraper import ResearchAgent, ScraperConfig, STEP_LABELS
 from google_ai_overview import fetch_ai_overview_sync
-from news_map import reverse_geocode, fetch_area_news, summarize_news
+from news_map import (
+    reverse_geocode, forward_geocode, fetch_area_news, summarize_news,
+    fetch_weather, fetch_elevation, fetch_wikipedia_summary,
+    web_search, summarize_topic,
+)
 
 # Persistent Chrome profile for the Quick-answer fetcher. Reusing it across runs
 # builds up cookies/trust. Kept inside the project (the C: drive is full here).
@@ -25,7 +29,7 @@ CHROME_PROFILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".chro
 
 RAG_MODE = "Deep research (RAG)"
 OVERVIEW_MODE = "Quick answer"
-NEWS_MAP_MODE = "News map"
+NEWS_MAP_MODE = "Area explorer (map)"
 
 st.set_page_config(page_title="Agentic Web Research", page_icon="🔎", layout="wide")
 
@@ -44,134 +48,328 @@ def get_reranker(name: str) -> CrossEncoder:
 
 
 # --------------------------------------------------------------------------- #
-# News map page — tap a location, see its news
+# Area Explorer page — search or tap a place, then pick what to learn about it
 # --------------------------------------------------------------------------- #
-def render_news_map(api_key: str, model: str, serper_api_key: str,
+DEFAULT_CENTER = [22.97, 78.65]  # India
+DEFAULT_ZOOM = 4
+CLICK_ZOOM = 11  # zoom level we fly to when a place is selected
+
+# Knowledge categories handled generically (web search → LLM summary → sources).
+# label -> the topic phrase used to search & prompt.
+KNOWLEDGE_TOPICS = {
+    "📜 History": "history",
+    "💰 Economy": "economy and major industries",
+    "🏖️ Tourism": "tourism, attractions and places to visit",
+    "🎓 Education": "education, schools, colleges and universities",
+    "👥 Demographics": "demographics, population, languages and religion",
+    "🏛️ Government": "government, administration and local governance",
+    "🚆 Transport": "transport, airport, railways and road connectivity",
+}
+
+# Dropdown order (News / Geography / Weather first, then the knowledge topics,
+# then a general Overview).
+CATEGORIES = (
+    ["📰 News", "🌍 Geography", "🌦️ Weather"]
+    + list(KNOWLEDGE_TOPICS)
+    + ["📖 Overview"]
+)
+
+
+def _select_area(geo: dict, cur_zoom=None) -> None:
+    """Record the chosen place, clear cached category data, and queue a fly-to."""
+    st.session_state["area_selected"] = {
+        "lat": geo["lat"], "lon": geo["lon"],
+        "area": geo.get("area", ""), "detail": geo.get("detail", ""),
+        "locality": geo.get("locality", ""), "state": geo.get("state", ""),
+        "country": geo.get("country", ""), "address": geo.get("address", {}),
+        "type": geo.get("type", ""), "category": geo.get("category", ""),
+    }
+    st.session_state["area_cache"] = {}  # new place -> drop old category results
+    target_zoom = max(int(cur_zoom or DEFAULT_ZOOM), CLICK_ZOOM)
+    st.session_state["area_force_view"] = {
+        "center": [geo["lat"], geo["lon"]], "zoom": target_zoom,
+    }
+    # Also store as the persisted view so later reruns (e.g. switching the
+    # category dropdown) rebuild the map here instead of snapping back to default.
+    st.session_state["area_view_center"] = [geo["lat"], geo["lon"]]
+    st.session_state["area_view_zoom"] = target_zoom
+
+
+def render_area_map(api_key: str, model: str, serper_api_key: str,
                     news_count: int, do_summary: bool) -> None:
-    """Interactive Folium map: tapping a point reverse-geocodes it to an area and
-    loads recent news for that area. State is kept in session_state because
-    st_folium re-runs the script on every map interaction."""
+    """Generic 'tap or search a place, then explore it' map.
+
+    A place can be selected two ways — by typing in the search bar (forward
+    geocode) or by tapping the map (reverse geocode). Either way it drops a
+    marker, zooms in, and shows whichever category the user picks from the
+    dropdown (News / Weather / Geography / Overview). Per-category results are
+    cached so flipping the dropdown doesn't refetch. State lives in
+    session_state because st_folium re-runs the script on every interaction."""
     import folium
     from streamlit_folium import st_folium
 
-    st.caption("Tap anywhere on the map to load recent news for that area.")
+    st.caption("Search a place or tap the map, then choose what you want to know about it.")
 
-    DEFAULT_CENTER = [22.97, 78.65]  # India
-    DEFAULT_ZOOM = 4
-    CLICK_ZOOM = 11  # zoom level we fly to when a point is tapped
+    # ----- Search bar (forward geocode) ---------------------------------- #
+    sc1, sc2 = st.columns([6, 1])
+    with sc1:
+        search_q = st.text_input(
+            "Search a place", key="area_search_box", label_visibility="collapsed",
+            placeholder="🔍 Search a place… e.g. Indore, Tokyo, Eiffel Tower",
+        )
+    with sc2:
+        search_clicked = st.button("Search", use_container_width=True)
 
-    fmap = folium.Map(location=DEFAULT_CENTER, zoom_start=DEFAULT_ZOOM, tiles="OpenStreetMap")
-    last = st.session_state.get("news_last_click")
-    if last:  # pin the currently selected spot
-        coord_str = f"{last['lat']:.5f}, {last['lon']:.5f}"
+    q = (search_q or "").strip()
+    # Fire on button OR Enter (Enter reruns with the same text -> dedupe via last).
+    if q and (search_clicked or q != st.session_state.get("area_last_search", "")):
+        st.session_state["area_last_search"] = q
+        with st.spinner(f"Locating “{q}”…"):
+            geo = forward_geocode(q)
+        if geo.get("lat") is not None:
+            _select_area(geo)
+            st.rerun()
+        else:
+            st.warning(f"Couldn't locate “{q}”. Try a more specific name.")
+
+    # ----- Build the map ------------------------------------------------- #
+    # Rebuild at the last-known view so reruns (category switches, etc.) don't
+    # snap the map back to the default; force_view still overrides on selection.
+    view_center = st.session_state.get("area_view_center", DEFAULT_CENTER)
+    view_zoom = st.session_state.get("area_view_zoom", DEFAULT_ZOOM)
+    fmap = folium.Map(location=view_center, zoom_start=view_zoom, tiles="OpenStreetMap")
+    sel = st.session_state.get("area_selected")
+    if sel:  # pin the currently selected place
         folium.Marker(
-            [last["lat"], last["lon"]],
-            tooltip=f"{last.get('area') or 'Selected area'} ({coord_str})",
+            [sel["lat"], sel["lon"]],
+            tooltip=f"{sel.get('area') or 'Selected place'} ({sel['lat']:.5f}, {sel['lon']:.5f})",
             popup=folium.Popup(
-                f"<b>{last.get('area') or 'Selected area'}</b><br>"
-                f"Lat: {last['lat']:.5f}<br>Lon: {last['lon']:.5f}",
+                f"<b>{sel.get('area') or 'Selected place'}</b><br>"
+                f"Lat: {sel['lat']:.5f}<br>Lon: {sel['lon']:.5f}",
                 max_width=260,
             ),
             icon=folium.Icon(color="red", icon="info-sign"),
         ).add_to(fmap)
 
-    # One-shot programmatic view: set right after a click so the map flies into
-    # (and zooms into) the tapped location. Popped so it only applies once —
-    # afterwards the stable `key` lets the user pan/zoom freely without it
-    # snapping back on every rerun.
-    force_view = st.session_state.pop("news_force_view", None)
+    # One-shot programmatic view so the map flies into the selected place once.
+    force_view = st.session_state.pop("area_force_view", None)
 
-    col_map, col_news = st.columns([3, 2])
+    col_map, col_info = st.columns([3, 2])
     with col_map:
         map_state = st_folium(
             fmap,
-            key="news_map",  # stable key preserves the user's view across reruns
+            key="area_map",  # stable key preserves the user's view across reruns
             center=force_view["center"] if force_view else None,
             zoom=force_view["zoom"] if force_view else None,
             height=540,
             use_container_width=True,
         )
-        # Live read-out of the most recent click, right under the map.
-        live = (map_state or {}).get("last_clicked")
-        if live:
-            st.caption(f"📍 Clicked coordinates — Lat `{live['lat']:.5f}`, Lon `{live['lng']:.5f}`")
 
-    # A fresh click? (compare against what we last loaded)
-    clicked = map_state.get("last_clicked") if map_state else None
+    # Remember the user's current view so the next rerun rebuilds the map here.
+    if map_state:
+        c = map_state.get("center")
+        if c:
+            st.session_state["area_view_center"] = [c["lat"], c["lng"]]
+        if map_state.get("zoom"):
+            st.session_state["area_view_zoom"] = map_state["zoom"]
+
+    # ----- Handle a fresh map tap (reverse geocode) ---------------------- #
+    clicked = (map_state or {}).get("last_clicked")
     if clicked:
-        lat, lon = clicked["lat"], clicked["lng"]
-        prev = st.session_state.get("news_last_click")
-        is_new = (
-            prev is None
-            or abs(prev["lat"] - lat) > 1e-6
-            or abs(prev["lon"] - lon) > 1e-6
-        )
-        if is_new:
-            with st.spinner("Locating the area and fetching its news…"):
-                geo = reverse_geocode(lat, lon)
-                area = geo.get("area") or f"{lat:.3f}, {lon:.3f}"
-                items = fetch_area_news(area, serper_api_key=serper_api_key, max_results=news_count)
-                summary = ""
-                if do_summary and items and api_key.strip():
-                    summary = summarize_news(Groq(api_key=api_key.strip()), model.strip(), area, items)
-            st.session_state["news_last_click"] = {
-                "lat": lat, "lon": lon, "area": area,
-                "detail": geo.get("detail", ""), "items": items, "summary": summary,
-            }
-            # Zoom into the tapped spot (don't zoom back out if already closer in).
-            cur_zoom = (map_state or {}).get("zoom") or DEFAULT_ZOOM
-            st.session_state["news_force_view"] = {
-                "center": [lat, lon], "zoom": max(int(cur_zoom), CLICK_ZOOM),
-            }
-            st.rerun()  # redraw with the marker, zoomed into the location, news loaded
+        # Dedupe against the last processed click so search/pan reruns don't
+        # re-fire the old click (st_folium keeps last_clicked across reruns).
+        lc = (round(clicked["lat"], 6), round(clicked["lng"], 6))
+        if lc != st.session_state.get("area_last_click"):
+            st.session_state["area_last_click"] = lc
+            with st.spinner("Locating the tapped point…"):
+                geo = reverse_geocode(clicked["lat"], clicked["lng"])
+            geo["lat"], geo["lon"] = clicked["lat"], clicked["lng"]
+            if not geo.get("area"):
+                geo["area"] = f"{clicked['lat']:.3f}, {clicked['lng']:.3f}"
+            _select_area(geo, cur_zoom=(map_state or {}).get("zoom"))
+            st.rerun()
 
-    with col_news:
-        data = st.session_state.get("news_last_click")
-        if not data:
-            st.info("👆 Tap a location on the map to load its news.")
+    # ----- Info panel ---------------------------------------------------- #
+    with col_info:
+        category = st.selectbox("Show me", CATEGORIES, key="area_category")
+
+        sel = st.session_state.get("area_selected")
+        if not sel:
+            st.info("👆 Search a place or tap the map to begin.")
             return
 
-        # --- What was clicked & where it resolved to -------------------- #
+        # What/where is selected.
         st.markdown(
-            f"**📍 Clicked coordinates**  \n"
-            f"Latitude: `{data['lat']:.5f}`  ·  Longitude: `{data['lon']:.5f}`"
+            f"**📍 Coordinates** — Lat `{sel['lat']:.5f}` · Lon `{sel['lon']:.5f}`"
         )
-        st.markdown(f"**🗺️ Resolved location:** {data.get('area') or 'Unknown area'}")
-        if data.get("detail"):
-            st.caption(f"Reverse-geocoded address: {data['detail']}")
+        st.markdown(f"**🗺️ Location:** {sel.get('area') or 'Unknown place'}")
+        if sel.get("detail"):
+            st.caption(sel["detail"])
         st.divider()
 
-        st.subheader(f"📰 News for {data.get('area') or 'this area'}")
-        if data.get("summary"):
-            st.markdown(data["summary"])
-            st.divider()
+        with st.spinner(f"Loading {category}…"):
+            data = _get_category_data(
+                category, sel, api_key, model, serper_api_key, news_count, do_summary
+            )
 
-        items = data.get("items") or []
-        if not items:
-            st.warning("No news found for this area. Try a nearby point or a larger place.")
-        for it in items:
-            title = it.get("title", "")
-            url = it.get("url", "")
-            st.markdown(f"**[{title}]({url})**" if url else f"**{title}**")
-            meta = " · ".join(x for x in [it.get("source", ""), it.get("date", "")] if x)
-            if meta:
-                st.caption(meta)
-            if it.get("snippet"):
-                st.write(it["snippet"])
-            st.divider()
+        if category.endswith("News"):
+            _render_news(data, sel, api_key, model, serper_api_key)
+        elif "Weather" in category:
+            _render_weather(data, sel)
+        elif "Geography" in category:
+            _render_geography(data, sel)
+        elif category in KNOWLEDGE_TOPICS:
+            _render_topic(category, data, sel, api_key, serper_api_key)
+        else:  # Overview
+            _render_overview(data, sel)
 
-        # Optional deep dive: reuse the full cited-RAG pipeline for this area.
-        if api_key.strip() and st.button("🔬 Deep dive — cited summary of this area"):
-            config = ScraperConfig(model=model.strip(), serper_api_key=serper_api_key.strip())
-            emb = get_embedding_model(config.embedding_model_name)
-            rer = get_reranker(config.reranker_model_name) if config.reranker_model_name else None
-            agent = ResearchAgent(Groq(api_key=api_key.strip()), emb, config, reranker=rer)
-            with st.spinner("Running deep research on this area…"):
-                result = agent.research(f"latest news about {data.get('area')}")
-            st.markdown(result.get("answer") or "_No answer was produced._")
-            score = result.get("confidence_score")
-            if score is not None:
-                st.caption(f"Confidence score {score:.2f}")
+
+def _get_category_data(category, sel, api_key, model, serper_api_key, news_count, do_summary):
+    """Fetch (and cache per category) the data for the selected place."""
+    cache = st.session_state.setdefault("area_cache", {})
+    if category in cache:
+        return cache[category]
+
+    lat, lon = sel["lat"], sel["lon"]
+    place = sel.get("area", "")
+    if category.endswith("News"):
+        items = fetch_area_news(place, serper_api_key=serper_api_key, max_results=news_count)
+        summary = ""
+        if do_summary and items and api_key.strip():
+            summary = summarize_news(Groq(api_key=api_key.strip()), model.strip(), place, items)
+        data = {"items": items, "summary": summary}
+    elif "Weather" in category:
+        data = fetch_weather(lat, lon)
+    elif "Geography" in category:
+        data = {"elevation": fetch_elevation(lat, lon)}
+    elif category in KNOWLEDGE_TOPICS:
+        topic = KNOWLEDGE_TOPICS[category]
+        snippets = web_search(f"{place} {topic}", serper_api_key=serper_api_key, max_results=6)
+        summary = ""
+        if api_key.strip() and (snippets or place):
+            wiki = fetch_wikipedia_summary(sel.get("locality") or place.split(",")[0])
+            summary = summarize_topic(Groq(api_key=api_key.strip()), model.strip(),
+                                      place, topic, snippets, wiki.get("extract", ""))
+        data = {"summary": summary, "sources": snippets}
+    else:  # Overview
+        title = sel.get("locality") or place.split(",")[0]
+        data = fetch_wikipedia_summary(title)
+        if not data and sel.get("state"):  # fall back to the broader region
+            data = fetch_wikipedia_summary(sel["state"])
+
+    # Only cache results that actually carry content, so a transient network
+    # failure (empty result) is retried next time rather than sticking.
+    if data and (not isinstance(data, dict) or any(data.values())):
+        cache[category] = data
+    return data
+
+
+def _render_news(data, sel, api_key, model, serper_api_key):
+    st.subheader(f"📰 News for {sel.get('area') or 'this area'}")
+    if data.get("summary"):
+        st.markdown(data["summary"])
+        st.divider()
+    items = data.get("items") or []
+    if not items:
+        st.warning("No news found for this area. Try a nearby point or a larger place.")
+    for it in items:
+        title, url = it.get("title", ""), it.get("url", "")
+        st.markdown(f"**[{title}]({url})**" if url else f"**{title}**")
+        meta = " · ".join(x for x in [it.get("source", ""), it.get("date", "")] if x)
+        if meta:
+            st.caption(meta)
+        if it.get("snippet"):
+            st.write(it["snippet"])
+        st.divider()
+
+    if api_key.strip() and st.button("🔬 Deep dive — cited summary of this area"):
+        config = ScraperConfig(model=model.strip(), serper_api_key=serper_api_key.strip())
+        emb = get_embedding_model(config.embedding_model_name)
+        rer = get_reranker(config.reranker_model_name) if config.reranker_model_name else None
+        agent = ResearchAgent(Groq(api_key=api_key.strip()), emb, config, reranker=rer)
+        with st.spinner("Running deep research on this area…"):
+            result = agent.research(f"latest news about {sel.get('area')}")
+        st.markdown(result.get("answer") or "_No answer was produced._")
+        score = result.get("confidence_score")
+        if score is not None:
+            st.caption(f"Confidence score {score:.2f}")
+
+
+def _render_weather(data, sel):
+    st.subheader(f"🌦️ Weather in {sel.get('area') or 'this area'}")
+    if not data:
+        st.warning("Weather is unavailable for this point right now.")
+        return
+    temp, feels = data.get("temp"), data.get("feels")
+    lines = [f"**Condition:** {data.get('condition', '—')}"]
+    if temp is not None:
+        t = f"**Temperature:** {temp}°C"
+        if feels is not None:
+            t += f" (feels like {feels}°C)"
+        lines.append(t)
+    if data.get("humidity") is not None:
+        lines.append(f"**Humidity:** {data['humidity']}%")
+    if data.get("wind") is not None:
+        lines.append(f"**Wind:** {data['wind']} km/h")
+    if data.get("precip") is not None:
+        lines.append(f"**Precipitation:** {data['precip']} mm")
+    st.markdown("  \n".join(lines))
+    st.caption("Current conditions · source: Open-Meteo")
+
+
+def _render_geography(data, sel):
+    st.subheader(f"🌍 Geography of {sel.get('area') or 'this area'}")
+    addr = sel.get("address") or {}
+    district = addr.get("state_district") or addr.get("county") or ""
+    lines = [f"**Coordinates:** {sel['lat']:.5f}, {sel['lon']:.5f}"]
+    if data.get("elevation") is not None:
+        lines.append(f"**Elevation:** {data['elevation']:.0f} m above sea level")
+    if sel.get("type"):
+        lines.append(f"**Place type:** {sel['type'].replace('_', ' ')}")
+    if sel.get("locality"):
+        lines.append(f"**City / town:** {sel['locality']}")
+    if district:
+        lines.append(f"**District:** {district}")
+    if sel.get("state"):
+        lines.append(f"**State / region:** {sel['state']}")
+    if sel.get("country"):
+        lines.append(f"**Country:** {sel['country']}")
+    st.markdown("  \n".join(lines))
+
+
+def _render_topic(category, data, sel, api_key, serper_api_key):
+    """Generic knowledge category (history, economy, tourism, …)."""
+    st.subheader(f"{category} — {sel.get('area') or 'this area'}")
+    summary = (data or {}).get("summary", "")
+    sources = (data or {}).get("sources") or []
+
+    if summary:
+        st.markdown(summary)
+    elif not api_key.strip():
+        st.info("Add a Groq API key in the sidebar for a written summary. "
+                "Showing the top sources below.")
+    elif not sources:
+        st.warning("Couldn't find information on this for this place. "
+                   "Try a larger/known place name.")
+
+    if sources:
+        st.divider()
+        st.caption("Sources")
+        for s in sources:
+            t, u = s.get("title", ""), s.get("url", "")
+            st.markdown(f"- [{t}]({u})" if u else f"- {t}")
+
+
+def _render_overview(data, sel):
+    st.subheader(f"📖 Overview of {sel.get('area') or 'this area'}")
+    if not data or not data.get("extract"):
+        st.info("No encyclopedic overview was found for this place.")
+        return
+    if data.get("thumb"):
+        st.image(data["thumb"], width=220)
+    st.write(data["extract"])
+    if data.get("url"):
+        st.markdown(f"[Read more on Wikipedia]({data['url']})")
 
 
 # --------------------------------------------------------------------------- #
@@ -186,7 +384,8 @@ with st.sidebar:
         help=(
             "Deep research: searches multiple pages and answers with RAG.\n\n"
             "Quick answer: returns a short, direct answer.\n\n"
-            "News map: tap a place on a map to see its news."
+            "Area explorer: search or tap a place to see its news, weather, "
+            "geography, and overview."
         ),
     )
 
@@ -230,17 +429,21 @@ with st.sidebar:
             overview_timeout_ms = st.number_input(
                 "Answer wait timeout (ms)", 10000, 60000, 25000, step=1000,
             )
-    else:  # NEWS_MAP_MODE
+    else:  # NEWS_MAP_MODE — Area explorer
         serper_api_key = st.text_input(
             "Serper API key (Google News)",
             type="password",
             value=os.getenv("SERPER_API_KEY", ""),
             help="Free key at https://serper.dev — gives Google News. Leave blank to use DuckDuckGo.",
         )
-        news_count = st.slider("Headlines per area", 3, 20, 8)
-        do_summary = st.checkbox("AI summary of the area's news", value=True)
+        with st.expander("News options"):
+            news_count = st.slider("Headlines per area", 3, 20, 8)
+            do_summary = st.checkbox("AI summary of the area's news", value=True)
         st.divider()
-        st.caption("tap point → reverse-geocode → fetch area news → optional AI summary")
+        st.caption(
+            "search / tap a place → news · weather · geography · overview\n\n"
+            "Weather, geography & overview are free (no key needed)."
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -249,9 +452,9 @@ with st.sidebar:
 st.title("🔎 Agentic Web Research Assistant")
 st.caption("LangGraph agent that searches the web, scrapes pages, and answers with RAG over what it finds.")
 
-# News map mode is fully self-contained (its own map + click handling).
+# Area explorer mode is fully self-contained (its own map + search + click handling).
 if mode == NEWS_MAP_MODE:
-    render_news_map(api_key, model, serper_api_key, news_count, do_summary)
+    render_area_map(api_key, model, serper_api_key, news_count, do_summary)
     st.stop()
 
 query = st.text_input(
