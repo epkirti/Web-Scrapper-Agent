@@ -542,7 +542,40 @@ def fetch_area_news(
 # --------------------------------------------------------------------------- #
 # Optional: short AI summary of an area's headlines
 # --------------------------------------------------------------------------- #
-def list_localities(groq_client, model: str, city: str, n: int = 12) -> list[str]:
+def _parse_name_list(raw: str, exclude: str, n: int) -> list[str]:
+    """Turn an LLM's comma/newline list of place names into a clean unique list,
+    dropping numbering, boilerplate prefixes and the parent place itself."""
+    out, seen = [], set()
+    for part in raw.replace("\n", ",").split(","):
+        # Drop any leading list markers / numbering (e.g. "1.", "-", "•").
+        name = part.strip().lstrip("0123456789.)-•*# \t").strip()
+        low = name.lower()
+        if (
+            name and low not in seen and 1 < len(name) < 40
+            and not low.startswith(("here", "sure", "the city", "the state",
+                                    "some ", "okay", "i "))
+            and exclude.strip().lower() != low
+        ):
+            seen.add(low)
+            out.append(name)
+    return out[:n]
+
+
+def _ask_name_list(client, model: str, prompt: str, exclude: str, n: int) -> list[str]:
+    """Run one LLM call and parse its reply into a clean place-name list."""
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0, max_tokens=200,
+        )
+        raw = resp.choices[0].message.content or ""
+    except Exception:
+        return []
+    return _parse_name_list(raw, exclude, n)
+
+
+def list_localities(client, model: str, city: str, n: int = 12) -> list[str]:
     """Ask the LLM for the well-known neighbourhoods/localities of a city, so the
     user can get news for a specific area (e.g. Bhawarkua, Vijay Nagar in Indore)
     even though map data doesn't reliably name them. Returns [] on failure."""
@@ -554,29 +587,21 @@ def list_localities(groq_client, model: str, city: str, n: int = 12) -> list[str
         "numbering, no description, no extra words. If the place is not a city with "
         "distinct named localities, return nothing."
     )
-    try:
-        resp = groq_client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.0, max_tokens=200,
-        )
-        raw = resp.choices[0].message.content or ""
-    except Exception:
-        return []
+    return _ask_name_list(client, model, prompt, city, n)
 
-    out, seen = [], set()
-    for part in raw.replace("\n", ",").split(","):
-        # Drop any leading list markers / numbering (e.g. "1.", "-", "•").
-        name = part.strip().lstrip("0123456789.)-•*# \t").strip()
-        low = name.lower()
-        if (
-            name and low not in seen and 1 < len(name) < 40
-            and not low.startswith(("here", "sure", "the city", "some ", "okay", "i "))
-            and city.lower() != low
-        ):
-            seen.add(low)
-            out.append(name)
-    return out[:n]
+
+def list_cities(client, model: str, state: str, n: int = 12) -> list[str]:
+    """Ask the LLM for the major cities/towns within a state or region, so the user
+    can drill the area picker State → City → locality. Returns [] on failure."""
+    if not state.strip():
+        return []
+    prompt = (
+        f"List up to {n} of the largest and most well-known cities or towns WITHIN "
+        f"the state/region of {state}. Return ONLY a comma-separated list of the "
+        "city names — no numbering, no description, no extra words. If it is not a "
+        "state or region with distinct cities, return nothing."
+    )
+    return _ask_name_list(client, model, prompt, state, n)
 
 
 def summarize_news(groq_client, model: str, area: str, items: list[dict],

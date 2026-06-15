@@ -35,7 +35,7 @@ from news_map import (
     reverse_geocode, forward_geocode, fetch_area_news, summarize_news,
     fetch_weather, fetch_elevation, fetch_wikipedia_summary,
     web_search, summarize_topic, HFChatClient, HF_MODEL,
-    fetch_air_quality, fetch_astro, list_localities,
+    fetch_air_quality, fetch_astro, list_localities, list_cities,
 )
 
 # Persistent Chrome profile for the Quick-answer fetcher. Reusing it across runs
@@ -97,6 +97,20 @@ CATEGORIES = (
     + ["📖 Overview"]
 )
 
+# India's 28 states + 8 union territories — the fixed top level of the region
+# cascade (State → City → Area). Cities/areas below are AI-generated per selection.
+INDIA_STATES = [
+    "Andhra Pradesh", "Arunachal Pradesh", "Assam", "Bihar", "Chhattisgarh",
+    "Goa", "Gujarat", "Haryana", "Himachal Pradesh", "Jharkhand", "Karnataka",
+    "Kerala", "Madhya Pradesh", "Maharashtra", "Manipur", "Meghalaya", "Mizoram",
+    "Nagaland", "Odisha", "Punjab", "Rajasthan", "Sikkim", "Tamil Nadu",
+    "Telangana", "Tripura", "Uttar Pradesh", "Uttarakhand", "West Bengal",
+    # Union territories
+    "Andaman and Nicobar Islands", "Chandigarh",
+    "Dadra and Nagar Haveli and Daman and Diu", "Delhi", "Jammu and Kashmir",
+    "Ladakh", "Lakshadweep", "Puducherry",
+]
+
 
 def _select_area(geo: dict, cur_zoom=None, news_hint: str = "") -> None:
     """Record the chosen place, clear cached category data, and queue a fly-to.
@@ -114,7 +128,10 @@ def _select_area(geo: dict, cur_zoom=None, news_hint: str = "") -> None:
         "news_hint": (news_hint or "").strip(),
     }
     st.session_state["area_cache"] = {}  # new place -> drop old category results
-    st.session_state["area_subarea"] = ""  # reset locality focus for the new place
+    # Reset the State → City → Area drill-down for the new place. Default the city
+    # level to the resolved city so the picker opens already focused on it.
+    st.session_state["area_pick_city"] = geo.get("locality", "") or ""
+    st.session_state["area_pick_area"] = ""
 
     # Keep a short most-recent-first list of selected places for quick re-select.
     entry = dict(st.session_state["area_selected"])
@@ -146,9 +163,11 @@ def _build_report(sel: dict) -> str:
     for cat, d in (st.session_state.get("area_cache") or {}).items():
         if not isinstance(d, dict):
             continue
-        if cat.startswith("News::"):  # composite news key -> readable heading
-            sub = cat.split("::", 1)[1]
-            cat = f"📰 News{f' — {sub}' if sub else ''}"
+        if "::" in cat:  # composite key (label::city|area) -> readable heading
+            label, level = cat.split("::", 1)
+            pick_city, _, pick_area = level.partition("|")
+            sub = pick_area or pick_city  # deepest chosen level
+            cat = f"{label}{f' — {sub}' if sub else ''}"
         lines.append(f"## {cat}")
         if d.get("summary"):
             lines.append(d["summary"])
@@ -217,6 +236,9 @@ def render_area_map(api_key: str, model: str, serper_api_key: str,
             st.rerun()
         else:
             st.warning(f"Couldn't locate “{q}”. Try a more specific name.")
+
+    # ----- Region cascade (State → City → Area, India) ------------------- #
+    _render_region_cascade()
 
     # ----- Recent places (quick re-select chips) ------------------------- #
     recent = st.session_state.get("area_recent") or []
@@ -344,34 +366,44 @@ def _get_category_data(category, sel, api_key, model, serper_api_key, news_count
                        news_time="", out_lang="English"):
     """Fetch (and cache per category) the data for the selected place."""
     cache = st.session_state.setdefault("area_cache", {})
-    # News is also keyed by the chosen locality focus, so switching areas refetches.
-    subarea = st.session_state.get("area_subarea", "")
-    cache_key = f"News::{subarea}" if category.endswith("News") else category
+    # News / topics / overview are keyed by the drill level too, so changing the
+    # State → City → Area picker refetches for the newly chosen level.
+    level = _drill_level_key()
+    if category.endswith("News") or category in KNOWLEDGE_TOPICS or category == "📖 Overview":
+        cache_key = f"{category}::{level}"
+    else:
+        cache_key = category
     if cache_key in cache:
         return cache[cache_key]
 
     lat, lon = sel["lat"], sel["lon"]
     place = sel.get("area", "")
-    hf = st.session_state.get("hf_token", "").strip()       # HF token for summaries
-    hf_model = st.session_state.get("hf_model", HF_MODEL)
+    client, mdl = _llm()                       # active provider for AI text features
     if category.endswith("News"):
-        city = sel.get("locality") or place
-        if subarea:  # focus on a specific locality within the city
-            subject = f"{subarea}, {city}" if city else subarea
-        else:
-            subject = _news_subject(sel)
+        state = (sel.get("state") or "").strip()
+        city = (st.session_state.get("area_pick_city") or "").strip()
+        # Most specific first, then widen (city → state → resolved place) until we
+        # have enough headlines, so a narrow locality never shows an empty list.
+        candidates = []
+        for cand in (_drill_subject(sel),
+                     ", ".join(p for p in (city, state) if p),
+                     state, place):
+            cand = (cand or "").strip()
+            if cand and cand not in candidates:
+                candidates.append(cand)
+        subject = candidates[0] if candidates else place
         items = fetch_area_news(subject, serper_api_key=serper_api_key,
                                 max_results=news_count, time_filter=news_time)
-        # If a specific area returned little, widen to the whole city so it's not empty.
-        if subject != place and place and len(items) < 2:
-            city_items = fetch_area_news(place, serper_api_key=serper_api_key,
-                                         max_results=news_count, time_filter=news_time)
-            if len(city_items) > len(items):
-                items, subject = city_items, place
+        for cand in candidates[1:]:
+            if len(items) >= 2:
+                break
+            more = fetch_area_news(cand, serper_api_key=serper_api_key,
+                                   max_results=news_count, time_filter=news_time)
+            if len(more) > len(items):
+                items, subject = more, cand
         summary = ""
-        if do_summary and items and hf:
-            summary = summarize_news(HFChatClient(token=hf, model=hf_model), model.strip(),
-                                     subject, items, lang=out_lang)
+        if do_summary and items and client is not None:
+            summary = summarize_news(client, mdl, subject, items, lang=out_lang)
         data = {"items": items, "summary": summary, "subject": subject}
     elif "Weather" in category:
         data = fetch_weather(lat, lon)
@@ -383,15 +415,16 @@ def _get_category_data(category, sel, api_key, model, serper_api_key, news_count
         }
     elif category in KNOWLEDGE_TOPICS:
         topic = KNOWLEDGE_TOPICS[category]
-        snippets = web_search(f"{place} {topic}", serper_api_key=serper_api_key, max_results=6)
+        place_q = _drill_subject(sel)          # follow the chosen drill level
+        snippets = web_search(f"{place_q} {topic}", serper_api_key=serper_api_key, max_results=6)
         summary = ""
-        if hf and (snippets or place):
-            wiki = fetch_wikipedia_summary(sel.get("locality") or place.split(",")[0])
-            summary = summarize_topic(HFChatClient(token=hf, model=hf_model), model.strip(),
-                                      place, topic, snippets, wiki.get("extract", ""), lang=out_lang)
+        if client is not None and (snippets or place_q):
+            wiki = fetch_wikipedia_summary(_drill_place(sel))
+            summary = summarize_topic(client, mdl, place_q, topic, snippets,
+                                      wiki.get("extract", ""), lang=out_lang)
         data = {"summary": summary, "sources": snippets}
     else:  # Overview
-        title = sel.get("locality") or place.split(",")[0]
+        title = _drill_place(sel)              # follow the chosen drill level
         data = fetch_wikipedia_summary(title)
         if not data and sel.get("state"):  # fall back to the broader region
             data = fetch_wikipedia_summary(sel["state"])
@@ -401,7 +434,7 @@ def _get_category_data(category, sel, api_key, model, serper_api_key, news_count
     cacheable = bool(data) and (not isinstance(data, dict) or any(data.values()))
     # If a token is set but the AI summary/digest came back empty despite having
     # material (a transient LLM failure), don't cache — so re-viewing retries it.
-    if hf and not (data or {}).get("summary"):
+    if client is not None and not (data or {}).get("summary"):
         if category in KNOWLEDGE_TOPICS and (data or {}).get("sources"):
             cacheable = False
         elif category.endswith("News") and (data or {}).get("items"):
@@ -411,47 +444,177 @@ def _get_category_data(category, sel, api_key, model, serper_api_key, news_count
     return data
 
 
-def _get_localities(city: str, api_key: str, model: str) -> list:
+def _llm():
+    """The active chat client + model for the Area Explorer's text features, chosen
+    by the sidebar 'AI provider'. Returns ``(None, "")`` when the provider's key is
+    missing. Both clients expose ``.chat.completions.create(...)``."""
+    provider = st.session_state.get("llm_provider", "Groq")
+    if provider == "Hugging Face":
+        hf = st.session_state.get("hf_token", "").strip()
+        if not hf:
+            return None, ""
+        hf_model = st.session_state.get("hf_model", HF_MODEL)
+        return HFChatClient(token=hf, model=hf_model), hf_model
+    key = st.session_state.get("groq_key", "").strip()
+    if not key:
+        return None, ""
+    return Groq(api_key=key), st.session_state.get("groq_model", "llama-3.3-70b-versatile")
+
+
+def _llm_ready() -> bool:
+    """True when the selected provider has a usable key configured."""
+    return _llm()[0] is not None
+
+
+def _llm_hint() -> str:
+    """Human phrase for the missing key, matching the selected provider."""
+    p = st.session_state.get("llm_provider", "Groq")
+    return "a Hugging Face API token" if p == "Hugging Face" else "a Groq API key"
+
+
+def _get_localities(city: str) -> list:
     """City localities (LLM-generated, cached per city) for the area-news dropdown."""
-    hf = st.session_state.get("hf_token", "").strip()
-    if not city.strip() or not hf:
+    client, mdl = _llm()
+    if not city.strip() or client is None:
         return []
     cache = st.session_state.setdefault("localities_cache", {})
     key = city.strip().lower()
     if key in cache:
         return cache[key]
-    locs = list_localities(
-        HFChatClient(token=hf, model=st.session_state.get("hf_model", HF_MODEL)),
-        model.strip(), city,
-    )
+    locs = list_localities(client, mdl, city)
     if locs:  # don't cache an empty (possibly transient) result
         cache[key] = locs
     return locs
 
 
-def _render_news(data, sel, api_key, model, serper_api_key):
-    # Locality focus: pick a specific area within the city for area-specific news.
-    city = (sel.get("locality") or sel.get("area", "").split(",")[0] or "").strip()
-    localities = _get_localities(city, api_key, model)
-    if localities:
-        all_label = f"All of {city}"
-        options = [all_label] + localities
-        cur = st.session_state.get("area_subarea", "")
-        idx = options.index(cur) if cur in options else 0
-        choice = st.selectbox(
-            f"📍 Area within {city} (for area-specific news)", options, index=idx,
-            key=f"subarea_select_{city}",
-        )
-        new_sub = "" if choice == all_label else choice
-        if new_sub != st.session_state.get("area_subarea", ""):
-            st.session_state["area_subarea"] = new_sub
-            st.rerun()
-    else:
-        # No locality list (no Groq key, or none generated) — guide manual drill-down.
-        st.caption("Tip: search a specific area (e.g. “Bhawarkua Indore”) for that locality's news. "
-                   "Add a Hugging Face API token to get a one-tap locality picker here.")
+def _get_cities(state: str) -> list:
+    """Cities of a state (LLM-generated, cached per state) for the drill-down."""
+    client, mdl = _llm()
+    if not state.strip() or client is None:
+        return []
+    cache = st.session_state.setdefault("cities_cache", {})
+    key = state.strip().lower()
+    if key in cache:
+        return cache[key]
+    locs = list_cities(client, mdl, state)
+    if locs:
+        cache[key] = locs
+    return locs
 
-    subject = data.get("subject") or sel.get("area") or "this area"
+
+def _drill_subject(sel: dict) -> str:
+    """Full news/topic subject from the State → City → Area picker, e.g.
+    "Bhawarkua, Indore, Madhya Pradesh". Falls back to the searched/selected place
+    when no level has been chosen (or no provider key to list levels)."""
+    state = (sel.get("state") or "").strip()
+    city = (st.session_state.get("area_pick_city") or "").strip()
+    area = (st.session_state.get("area_pick_area") or "").strip()
+    parts = [p for p in (area, city, state) if p]
+    return ", ".join(parts) if parts else _news_subject(sel)
+
+
+def _drill_place(sel: dict) -> str:
+    """The deepest chosen level's own name (area > city > state), used as the title
+    for topic/overview lookups and the chat heading."""
+    area = (st.session_state.get("area_pick_area") or "").strip()
+    city = (st.session_state.get("area_pick_city") or "").strip()
+    state = (sel.get("state") or "").strip()
+    return area or city or state or sel.get("locality") or sel.get("area", "")
+
+
+def _drill_level_key() -> str:
+    """Cache discriminator for the current drill level (city|area)."""
+    return (f"{st.session_state.get('area_pick_city','')}|"
+            f"{st.session_state.get('area_pick_area','')}")
+
+
+def _locate_region(state: str, city: str, area: str) -> dict:
+    """Geocode the deepest non-empty level, widening (area→city→state) until a hit.
+    All queries are scoped to India. Returns {} if nothing resolves."""
+    for parts in ([area, city, state], [city, state], [state]):
+        if not any(parts):
+            continue
+        q = ", ".join([p for p in parts if p] + ["India"])
+        geo = forward_geocode(q)
+        if geo.get("lat") is not None:
+            return geo
+    return {}
+
+
+def _render_region_cascade() -> None:
+    """Top-of-page State → City → Area picker (India). Selecting any level locates
+    that place, drops the pin, and scopes news/topics to the deepest chosen level.
+    State is a fixed list; City and Area are AI-generated for the level above."""
+    sel = st.session_state.get("area_selected") or {}
+    applied_state = (sel.get("state") or "").strip()
+    applied_city = (st.session_state.get("area_pick_city") or "").strip()
+    applied_area = (st.session_state.get("area_pick_area") or "").strip()
+
+    st.caption("🧭 Or browse India by region — pick a State, then City, then Area.")
+    c1, c2, c3 = st.columns(3)
+
+    # Level 1 — State (fixed list).
+    with c1:
+        opts = ["— State —"] + INDIA_STATES
+        idx = opts.index(applied_state) if applied_state in opts else 0
+        state_choice = st.selectbox("State", opts, index=idx, key="region_state")
+    state = "" if state_choice == "— State —" else state_choice
+
+    # Level 2 — City within the state (AI-generated).
+    cities = _get_cities(state) if state else []
+    with c2:
+        if state and cities:
+            copts = [f"All of {state}"] + cities
+            cidx = copts.index(applied_city) if applied_city in copts else 0
+            city_choice = st.selectbox("City", copts, index=cidx, key=f"region_city_{state}")
+            city = "" if city_choice == f"All of {state}" else city_choice
+        else:
+            city = ""
+            st.selectbox("City", ["— pick a state first —"], disabled=True,
+                         key="region_city_disabled")
+
+    # Level 3 — Area within the chosen city (AI-generated).
+    localities = _get_localities(city) if city else []
+    with c3:
+        if city and localities:
+            aopts = [f"All of {city}"] + localities
+            aidx = aopts.index(applied_area) if applied_area in aopts else 0
+            area_choice = st.selectbox("Area", aopts, index=aidx, key=f"region_area_{city}")
+            area = "" if area_choice == f"All of {city}" else area_choice
+        else:
+            area = ""
+            st.selectbox("Area", ["— pick a city first —"], disabled=True,
+                         key="region_area_disabled")
+
+    if state and not _llm_ready():
+        st.caption(f"💡 Add {_llm_hint()} in the sidebar to list this state's cities & areas.")
+
+    # Apply the selection when it differs from what's currently shown on the map.
+    if state and (state, city, area) != (applied_state, applied_city, applied_area):
+        with st.spinner("Locating selection…"):
+            geo = _locate_region(state, city, area)
+        if geo.get("lat") is not None:
+            _select_area(geo, news_hint=(area or city or state))
+            s = st.session_state["area_selected"]
+            s["state"] = state                       # keep the chosen level authoritative
+            if city:
+                s["locality"] = city
+            st.session_state["area_pick_city"] = city
+            st.session_state["area_pick_area"] = area
+            st.rerun()
+        else:
+            st.warning("Couldn't locate that selection on the map. Try a different level.")
+
+
+def _render_news(data, sel, api_key, model, serper_api_key):
+    if not _llm_ready():
+        st.caption(
+            "Tip: pick a State / City / Area above, or search a specific area "
+            f"(e.g. “Bhawarkua Indore”). Add {_llm_hint()} for AI City/Area lists "
+            "and a concise digest."
+        )
+
+    subject = data.get("subject") or _drill_subject(sel) or sel.get("area") or "this area"
     st.subheader(f"📰 News — {subject}")
 
     items = data.get("items") or []
@@ -460,8 +623,8 @@ def _render_news(data, sel, api_key, model, serper_api_key):
     # Concise digest first: the consolidated "everything in one place" view.
     if summary:
         st.info(f"**📋 In short**\n\n{summary}")
-    elif items and not st.session_state.get("hf_token", "").strip():
-        st.caption("🔑 Add a Hugging Face API token in the sidebar for a concise digest of the headlines below.")
+    elif items and not _llm_ready():
+        st.caption(f"🔑 Add {_llm_hint()} in the sidebar for a concise digest of the headlines below.")
 
     if not items:
         st.warning("No news found for this area. Try a nearby point or a larger place.")
@@ -578,7 +741,7 @@ def _render_geography(data, sel):
 
 def _render_topic(category, data, sel, api_key, serper_api_key):
     """Generic knowledge category (history, economy, tourism, …)."""
-    st.subheader(f"{category} — {sel.get('area') or 'this area'}")
+    st.subheader(f"{category} — {_drill_place(sel) or 'this area'}")
     summary = (data or {}).get("summary", "")
     sources = (data or {}).get("sources") or []
 
@@ -586,11 +749,11 @@ def _render_topic(category, data, sel, api_key, serper_api_key):
         # Best case: an AI-written summary from the sources.
         st.markdown(summary)
     elif sources:
-        # No AI summary (no Groq key, or the model call failed/returned nothing) —
+        # No AI summary (no provider key, or the model call failed/returned nothing) —
         # still show readable content by surfacing the source snippets themselves,
         # so the topic is never just a list of bare links.
-        if not st.session_state.get("hf_token", "").strip():
-            st.caption("🔑 Add a Hugging Face API token in the sidebar for a written summary. "
+        if not _llm_ready():
+            st.caption(f"🔑 Add {_llm_hint()} in the sidebar for a written summary. "
                        "Here's what the sources say:")
         else:
             st.caption("Here's what the sources say:")
@@ -615,7 +778,7 @@ def _render_topic(category, data, sel, api_key, serper_api_key):
 
 
 def _render_overview(data, sel):
-    st.subheader(f"📖 Overview of {sel.get('area') or 'this area'}")
+    st.subheader(f"📖 Overview of {_drill_place(sel) or 'this area'}")
     if not data or not data.get("extract"):
         st.info("No encyclopedic overview was found for this place.")
         return
@@ -692,7 +855,7 @@ def _area_chat_reply(client, model: str, place: str, context: str, history: list
 
 def _render_area_chat(sel: dict, api_key: str, model: str, serper_api_key: str,
                       out_lang: str = "English") -> None:
-    place = sel.get("area") or "this place"
+    place = _drill_place(sel) or sel.get("area") or "this place"
     st.divider()
     st.subheader(f"💬 Ask about {place}")
     st.caption("Ask follow-up questions — answers use what's been gathered here plus a quick web check.")
@@ -709,9 +872,9 @@ def _render_area_chat(sel: dict, api_key: str, model: str, serper_api_key: str,
 
     # Only show the input once a key is present — a persistent note otherwise
     # (a transient on-submit warning would just flash and vanish on the next rerun).
-    hf = st.session_state.get("hf_token", "").strip()
-    if not hf:
-        st.info("🔑 Add a Hugging Face API token in the sidebar to chat about this place.")
+    client, mdl = _llm()
+    if client is None:
+        st.info(f"🔑 Add {_llm_hint()} in the sidebar to chat about this place.")
         return
 
     user_q = st.chat_input(f"e.g. What is {place} famous for? Best time to visit?")
@@ -728,9 +891,8 @@ def _render_area_chat(sel: dict, api_key: str, model: str, serper_api_key: str,
                 snippets = web_search(f"{place} {user_q}", serper_api_key=serper_api_key, max_results=5)
                 context = _area_chat_context(sel, snippets)
                 reply = _area_chat_reply(
-                    HFChatClient(token=hf, model=st.session_state.get("hf_model", HF_MODEL)),
-                    model.strip(), place, context, st.session_state["area_chat"], lang=out_lang,
-
+                    client, mdl, place, context, st.session_state["area_chat"],
+                    lang=out_lang,
                 )
             except Exception as exc:  # surfaced, never crashes the chat
                 reply = (f"Sorry, I couldn't answer that just now.\n\n"
@@ -757,29 +919,54 @@ with st.sidebar:
         ),
     )
 
-    api_key = st.text_input(
-        "Groq API key",
-        type="password",
-        value=os.getenv("GROQ_API_KEY", ""),
-        help="Get one at https://console.groq.com/keys",
-    )
-    model = st.text_input("Groq model", value="llama-3.3-70b-versatile")
+    # Defaults (env-seeded). The visible fields depend on the mode and, for the
+    # Area Explorer, on the chosen AI provider.
+    GROQ_DEFAULT_MODEL = "llama-3.3-70b-versatile"
+    api_key = os.getenv("GROQ_API_KEY", "")
+    model = GROQ_DEFAULT_MODEL
+    hf_token = os.getenv("HF_TOKEN", "") or os.getenv("HUGGINGFACEHUB_API_TOKEN", "")
+    hf_model = os.getenv("HF_MODEL", HF_MODEL)
 
-    hf_token = st.text_input(
-        "Hugging Face API token",
-        type="password",
-        value=os.getenv("HF_TOKEN", "") or os.getenv("HUGGINGFACEHUB_API_TOKEN", ""),
-        help="From https://huggingface.co/settings/tokens — powers the Area Explorer summaries & chat.",
-    )
-    hf_model = st.text_input(
-        "Hugging Face model",
-        value=os.getenv("HF_MODEL", HF_MODEL),
-        help="Must be served by HF Inference Providers. Gated models (meta-llama/*) "
-             "need their license accepted on HF or inference returns 403; "
-             "Qwen/Qwen2.5-7B-Instruct is open and works out of the box.",
-    )
+    if mode == NEWS_MAP_MODE:
+        # The Area Explorer can run on either provider — pick one and paste its key.
+        provider = st.radio(
+            "AI provider",
+            ["Groq", "Hugging Face"],
+            horizontal=True,
+            help="Powers the area list, news summaries, topics and chat. "
+                 "Pick one and paste its key below.",
+        )
+        if provider == "Groq":
+            api_key = st.text_input(
+                "Groq API key", type="password", value=api_key,
+                help="Get one at https://console.groq.com/keys",
+            )
+            model = st.text_input("Groq model", value=GROQ_DEFAULT_MODEL)
+        else:
+            hf_token = st.text_input(
+                "Hugging Face API token", type="password", value=hf_token,
+                help="From https://huggingface.co/settings/tokens",
+            )
+            hf_model = st.text_input(
+                "Hugging Face model", value=hf_model,
+                help="Must be served by HF Inference Providers. Gated models "
+                     "(meta-llama/*) need their license accepted on HF or inference "
+                     "returns 403; Qwen/Qwen2.5-7B-Instruct is open and works out of the box.",
+            )
+    else:
+        # RAG / Quick answer always run on Groq.
+        provider = "Groq"
+        api_key = st.text_input(
+            "Groq API key", type="password", value=api_key,
+            help="Get one at https://console.groq.com/keys",
+        )
+        model = st.text_input("Groq model", value=GROQ_DEFAULT_MODEL)
+
+    st.session_state["llm_provider"] = provider
+    st.session_state["groq_key"] = api_key
+    st.session_state["groq_model"] = (model or "").strip() or GROQ_DEFAULT_MODEL
     st.session_state["hf_token"] = hf_token
-    st.session_state["hf_model"] = hf_model.strip() or HF_MODEL
+    st.session_state["hf_model"] = (hf_model or "").strip() or HF_MODEL
 
     if mode == RAG_MODE:
         embedding_model_name = st.text_input("Embedding model", value="all-MiniLM-L6-v2")
