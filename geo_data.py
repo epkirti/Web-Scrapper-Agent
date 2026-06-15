@@ -41,6 +41,40 @@ def list_areas(state: str, district: str) -> list:
     return [a[0] for a in node["areas"]] if node else []
 
 
+# Directional / generic district names that are also common words — never use these
+# to filter news (they'd match "north India", "central govt", etc.).
+_GENERIC_PLACES = {
+    "central", "east", "west", "north", "south", "new delhi", "north east",
+    "north west", "south east", "south west", "city",
+}
+
+
+@functools.lru_cache(maxsize=1)
+def _state_district_names():
+    states = set(_data().keys())
+    districts = set()
+    for node in _data().values():
+        districts |= set(node.get("districts", {}).keys())
+    return states, districts
+
+
+@functools.lru_cache(maxsize=256)
+def competing_places(state: str, district: str) -> frozenset:
+    """Lowercased names of OTHER states and districts, used to filter out news from
+    same-named places in other cities (e.g. a Harsiddhi temple in Ujjain/Gujarat when
+    you searched Indore). Short (<4 chars) and generic/directional names are skipped
+    so we never match common words. The target's own state/district are never included."""
+    states, districts = _state_district_names()
+    out = {s.lower() for s in states if s and s != state}
+    for d in districts:
+        dl = d.lower()
+        if d and d != district and len(d) >= 4 and dl not in _GENERIC_PLACES:
+            out.add(dl)
+    out.discard((district or "").lower())
+    out.discard((state or "").lower())
+    return frozenset(out)
+
+
 def _coord(node: dict):
     la, lo = node.get("lat"), node.get("lon")
     return (la, lo) if la is not None else None

@@ -13,8 +13,9 @@ from __future__ import annotations
 
 import datetime as _dt
 import re
+import xml.etree.ElementTree as ET
 from typing import Optional
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 import httpx
 from huggingface_hub import InferenceClient
@@ -51,12 +52,14 @@ def _parse_news_dt(raw: str) -> Optional[_dt.datetime]:
     return None
 
 
-def _dedupe_sort_news(items: list[dict]) -> list[dict]:
-    """Drop duplicate stories and order them latest-first.
+def _dedupe_news(items: list[dict], sort: bool = True) -> list[dict]:
+    """Drop duplicate stories and tidy each item's ``date`` to "10 Jun 2024".
 
     Dedup is by URL first, then by a normalized title (case/punctuation-insensitive)
-    so the same story from one source isn't repeated. Each item's ``date`` is
-    rewritten to a tidy "10 Jun 2024" when parseable; undated items sort last."""
+    so the same story isn't repeated. When ``sort`` is True the result is ordered
+    newest-first (undated last); when False the input order is preserved — used for
+    area-specific searches, where the source's relevance ranking matters more than
+    recency (e.g. Google News already ranks the locality's stories best-first)."""
     seen_url, seen_title, out = set(), set(), []
     for it in items:
         url = (it.get("url") or "").strip().rstrip("/").lower()
@@ -73,9 +76,9 @@ def _dedupe_sort_news(items: list[dict]) -> list[dict]:
         if dt is not None:
             new["date"] = dt.strftime("%d %b %Y")
         out.append(new)
-    # Dated items first (newest → oldest), then undated ones.
-    out.sort(key=lambda x: (x["_dt"] is not None, x["_dt"] or _dt.datetime.min),
-             reverse=True)
+    if sort:  # dated items first (newest → oldest), then undated ones
+        out.sort(key=lambda x: (x["_dt"] is not None, x["_dt"] or _dt.datetime.min),
+                 reverse=True)
     for it in out:
         it.pop("_dt", None)
     return out
@@ -527,57 +530,67 @@ def summarize_topic(groq_client, model: str, place: str, topic: str,
 # --------------------------------------------------------------------------- #
 # Area name -> news headlines
 # --------------------------------------------------------------------------- #
-def fetch_area_news(
-    area: str,
-    serper_api_key: str = "",
-    max_results: int = 10,
-    timeout: float = 20.0,
-    time_filter: str = "",
-) -> list[dict]:
-    """Recent news for an area.
-
-    Uses Serper's Google News endpoint when ``serper_api_key`` is set, otherwise
-    (or on failure) falls back to DuckDuckGo news (no key). Each item is
-    normalized to ``{title, url, source, date, snippet}``.
-
-    ``time_filter`` limits recency: "" (any time), "d" (24h), "w" (week),
-    "m" (month).
-    """
-    if not area.strip():
+def _serper_news(query, serper_api_key, max_results, timeout, time_filter) -> list[dict]:
+    """Google News via Serper (needs a key). [] on any failure."""
+    try:
+        payload = {"q": query, "num": max_results}
+        if time_filter in ("d", "w", "m"):
+            payload["tbs"] = f"qdr:{time_filter}"
+        resp = httpx.post(
+            "https://google.serper.dev/news",
+            headers={"X-API-KEY": serper_api_key, "Content-Type": "application/json"},
+            json=payload, timeout=timeout,
+        )
+        resp.raise_for_status()
+        return [
+            {"title": it.get("title", ""), "url": it.get("link", ""),
+             "source": it.get("source", ""), "date": it.get("date", ""),
+             "snippet": it.get("snippet", "")}
+            for it in (resp.json().get("news", []) or []) if it.get("title")
+        ]
+    except Exception:
         return []
-    query = f"{area} news"
 
-    if serper_api_key:
-        try:
-            payload = {"q": query, "num": max_results}
-            if time_filter in ("d", "w", "m"):
-                payload["tbs"] = f"qdr:{time_filter}"
-            resp = httpx.post(
-                "https://google.serper.dev/news",
-                headers={"X-API-KEY": serper_api_key, "Content-Type": "application/json"},
-                json=payload,
-                timeout=timeout,
-            )
-            resp.raise_for_status()
-            items = resp.json().get("news", []) or []
-            out = [
-                {
-                    "title": it.get("title", ""),
-                    "url": it.get("link", ""),
-                    "source": it.get("source", ""),
-                    "date": it.get("date", ""),
-                    "snippet": it.get("snippet", ""),
-                }
-                for it in items
-                if it.get("title")
-            ]
-            out = _dedupe_sort_news(out)
-            if out:
-                return out[:max_results]
-        except Exception:
-            pass  # fall through to DuckDuckGo
 
-    # Fallback: DuckDuckGo news (no API key required).
+def _google_rss_news(area, max_results, timeout, time_filter) -> list[dict]:
+    """Google News RSS — free, no key, strong for Indian local news. [] on failure."""
+    q = f"{area} news"
+    when = {"d": "1d", "w": "7d", "m": "1m"}.get(time_filter)
+    if when:
+        q += f" when:{when}"
+    url = "https://news.google.com/rss/search?" + urlencode(
+        {"q": q, "hl": "en-IN", "gl": "IN", "ceid": "IN:en"})
+    try:
+        resp = httpx.get(url, headers=_UA, timeout=timeout, follow_redirects=True)
+        resp.raise_for_status()
+        root = ET.fromstring(resp.content)
+    except Exception:
+        return []
+    out = []
+    for item in root.iterfind(".//item"):
+        title = (item.findtext("title") or "").strip()
+        if not title:
+            continue
+        src_el = item.find("source")
+        source = (src_el.text or "").strip() if src_el is not None else ""
+        # Google appends " - Publisher" to titles; trim it for a clean headline.
+        if source and title.endswith(f"- {source}"):
+            title = title[: -(len(source) + 2)].rstrip(" -")
+        snippet = re.sub(r"<[^>]+>", " ", item.findtext("description") or "")
+        out.append({
+            "title": title,
+            "url": (item.findtext("link") or "").strip(),
+            "source": source,
+            "date": (item.findtext("pubDate") or "").strip(),
+            "snippet": re.sub(r"\s+", " ", snippet).strip(),
+        })
+        if len(out) >= max_results:
+            break
+    return out
+
+
+def _ddg_news(query, max_results, time_filter) -> list[dict]:
+    """DuckDuckGo news — free, no key. [] on failure."""
     try:
         from ddgs import DDGS
 
@@ -586,20 +599,76 @@ def fetch_area_news(
             kw["timelimit"] = time_filter
         with DDGS() as ddgs:
             results = list(ddgs.news(query, **kw))
-        out = _dedupe_sort_news([
-            {
-                "title": r.get("title", ""),
-                "url": r.get("url", "") or r.get("href", ""),
-                "source": r.get("source", ""),
-                "date": r.get("date", ""),
-                "snippet": r.get("body", ""),
-            }
-            for r in results
-            if r.get("title")
-        ])
-        return out[:max_results]
+        return [
+            {"title": r.get("title", ""), "url": r.get("url", "") or r.get("href", ""),
+             "source": r.get("source", ""), "date": r.get("date", ""),
+             "snippet": r.get("body", "")}
+            for r in results if r.get("title")
+        ]
     except Exception:
         return []
+
+
+def fetch_area_news(
+    area: str,
+    serper_api_key: str = "",
+    max_results: int = 10,
+    timeout: float = 20.0,
+    time_filter: str = "",
+    area_specific: bool = False,
+    keep_terms: Optional[list[str]] = None,
+    exclude_terms: Optional[list[str]] = None,
+) -> list[dict]:
+    """Recent news for a place, merged from multiple sources, de-duplicated (by URL
+    and title). Each item is ``{title, url, source, date, snippet}``.
+
+    Two modes:
+    - Broad (default): combine Serper Google News (if key) + Google News RSS +
+      DuckDuckGo, sorted newest-first. Best for a city/state where breadth and
+      recency matter.
+    - ``area_specific=True``: a narrow locality search. Use only the relevance-smart
+      engines (Serper + Google News RSS) and KEEP their ranking — DuckDuckGo is
+      dropped because it returns generic district news, and date-sorting would bury
+      the locality's own (often older) stories under recent city-wide ones.
+
+    Locality pinning (so "Harsiddhi" doesn't pull in Ujjain/Gujarat temples):
+    ``keep_terms``  — if an item mentions any of these (e.g. the city "Indore") it is
+    always kept. ``exclude_terms`` — an item that mentions any of these *other* places
+    (as whole words) and none of ``keep_terms`` is dropped. Items that name no other
+    place are kept (they're usually about the searched locality).
+
+    ``time_filter`` limits recency: "" (any time), "d" (24h), "w" (week), "m" (month).
+    """
+    if not area.strip():
+        return []
+    query = f"{area} news"
+
+    combined: list[dict] = []
+    if serper_api_key:
+        combined += _serper_news(query, serper_api_key, max_results, timeout, time_filter)
+    combined += _google_rss_news(area, max_results, timeout, time_filter)
+    if not area_specific:
+        combined += _ddg_news(query, max_results, time_filter)
+
+    items = _dedupe_news(combined, sort=not area_specific)
+
+    keep = [t.lower() for t in (keep_terms or []) if t and len(t) > 2]
+    excl = [t for t in (exclude_terms or []) if t and len(t) > 2]
+    if keep or excl:
+        excl_re = (re.compile(r"\b(" + "|".join(re.escape(t) for t in excl) + r")\b", re.I)
+                   if excl else None)
+
+        def _ok(it: dict) -> bool:
+            text = (it.get("title", "") + " " + it.get("snippet", "")).lower()
+            if any(k in text for k in keep):
+                return True                      # mentions the target city -> keep
+            if excl_re and excl_re.search(text):
+                return False                     # names another city/state -> drop
+            return True                          # names no other place -> keep
+
+        items = [it for it in items if _ok(it)]
+
+    return items[:max_results]
 
 
 # --------------------------------------------------------------------------- #

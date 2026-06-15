@@ -373,6 +373,7 @@ def _get_category_data(category, sel, api_key, model, serper_api_key, news_count
         # When a specific Area/District is chosen, fetch ALL of that place's news —
         # any time (older included), area-only, and more of it — instead of the
         # sidebar's recency window. State level keeps the chosen recency.
+        area_chosen = bool(area)                  # a narrow locality is in focus
         specific = bool(area or district)
         time_filter = "" if specific else news_time
         fetch_n = max(news_count, 30) if specific else news_count
@@ -385,10 +386,22 @@ def _get_category_data(category, sel, api_key, model, serper_api_key, news_count
             if cand and cand not in candidates:
                 candidates.append(cand)
         subject = candidates[0] if candidates else place
+        # The first (most specific) query honours area-specific ranking; widening
+        # falls back to broad city/state news (all sources, newest-first). For an
+        # area, keep items that mention the city OR no other place, and drop those
+        # naming a different city/state — so a same-named Harsiddhi temple in
+        # Ujjain/Gujarat is filtered out without losing the city's own un-tagged news.
+        keep_terms, exclude_terms = [], []
+        if area_chosen:
+            for t in (district, sel.get("locality", "")):
+                t = (t or "").strip()
+                if t and t.lower() not in [k.lower() for k in keep_terms]:
+                    keep_terms.append(t)
+            exclude_terms = list(geo_data.competing_places(state, district))
         items = fetch_area_news(subject, serper_api_key=serper_api_key,
-                                max_results=fetch_n, time_filter=time_filter)
-        # Widen only to avoid an empty list: for a specific area keep it area-only
-        # (widen just when nothing was found); otherwise prefer a fuller result.
+                                max_results=fetch_n, time_filter=time_filter,
+                                area_specific=area_chosen,
+                                keep_terms=keep_terms, exclude_terms=exclude_terms)
         threshold = 1 if specific else 2
         for cand in candidates[1:]:
             if len(items) >= threshold:
@@ -549,14 +562,27 @@ def _render_region_cascade() -> None:
             st.selectbox("District", ["— pick a state first —"], disabled=True,
                          key="region_district_disabled")
 
-    # Level 3 — Area within the chosen district.
-    areas = geo_data.list_areas(state, district) if district else []
+    # Level 3 — Area within the chosen district. The bundled list can't cover every
+    # locality, so the user can either pick from the dropdown or type any area name.
     with c3:
-        if areas:
-            aopts = [f"All of {district}"] + areas
-            aidx = aopts.index(applied_area) if applied_area in aopts else 0
-            a_choice = st.selectbox("Area", aopts, index=aidx, key=f"region_area_{district}")
-            area = "" if a_choice == f"All of {district}" else a_choice
+        if district:
+            mode = st.radio(
+                "Area", ["Dropdown", "Type manually"], horizontal=True,
+                key=f"area_mode_{district}",
+                help="Pick a listed area, or type one that isn't in the list.",
+            )
+            if mode == "Type manually":
+                area = st.text_input(
+                    "Area", value=applied_area, key=f"region_area_text_{district}",
+                    placeholder=f"Type an area in {district}…", label_visibility="collapsed",
+                ).strip()
+            else:
+                areas = geo_data.list_areas(state, district)
+                aopts = [f"All of {district}"] + areas
+                aidx = aopts.index(applied_area) if applied_area in aopts else 0
+                a_choice = st.selectbox("Area", aopts, index=aidx, label_visibility="collapsed",
+                                        key=f"region_area_{district}")
+                area = "" if a_choice == f"All of {district}" else a_choice
         else:
             area = ""
             st.selectbox("Area", ["— pick a district first —"], disabled=True,
