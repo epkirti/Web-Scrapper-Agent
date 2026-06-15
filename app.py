@@ -35,8 +35,9 @@ from news_map import (
     reverse_geocode, forward_geocode, fetch_area_news, summarize_news,
     fetch_weather, fetch_elevation, fetch_wikipedia_summary,
     web_search, summarize_topic, HFChatClient, HF_MODEL,
-    fetch_air_quality, fetch_astro, list_localities, list_cities,
+    fetch_air_quality, fetch_astro,
 )
+import geo_data
 
 # Persistent Chrome profile for the Quick-answer fetcher. Reusing it across runs
 # builds up cookies/trust. Kept inside the project (the C: drive is full here).
@@ -97,20 +98,6 @@ CATEGORIES = (
     + ["📖 Overview"]
 )
 
-# India's 28 states + 8 union territories — the fixed top level of the region
-# cascade (State → City → Area). Cities/areas below are AI-generated per selection.
-INDIA_STATES = [
-    "Andhra Pradesh", "Arunachal Pradesh", "Assam", "Bihar", "Chhattisgarh",
-    "Goa", "Gujarat", "Haryana", "Himachal Pradesh", "Jharkhand", "Karnataka",
-    "Kerala", "Madhya Pradesh", "Maharashtra", "Manipur", "Meghalaya", "Mizoram",
-    "Nagaland", "Odisha", "Punjab", "Rajasthan", "Sikkim", "Tamil Nadu",
-    "Telangana", "Tripura", "Uttar Pradesh", "Uttarakhand", "West Bengal",
-    # Union territories
-    "Andaman and Nicobar Islands", "Chandigarh",
-    "Dadra and Nagar Haveli and Daman and Diu", "Delhi", "Jammu and Kashmir",
-    "Ladakh", "Lakshadweep", "Puducherry",
-]
-
 
 def _select_area(geo: dict, cur_zoom=None, news_hint: str = "") -> None:
     """Record the chosen place, clear cached category data, and queue a fly-to.
@@ -128,9 +115,9 @@ def _select_area(geo: dict, cur_zoom=None, news_hint: str = "") -> None:
         "news_hint": (news_hint or "").strip(),
     }
     st.session_state["area_cache"] = {}  # new place -> drop old category results
-    # Reset the State → City → Area drill-down for the new place. Default the city
-    # level to the resolved city so the picker opens already focused on it.
-    st.session_state["area_pick_city"] = geo.get("locality", "") or ""
+    # Reset the State → District → Area drill-down for the new place. Seed the
+    # middle level with the resolved city/district so the picker opens focused.
+    st.session_state["area_pick_district"] = geo.get("locality", "") or ""
     st.session_state["area_pick_area"] = ""
 
     # Keep a short most-recent-first list of selected places for quick re-select.
@@ -381,12 +368,12 @@ def _get_category_data(category, sel, api_key, model, serper_api_key, news_count
     client, mdl = _llm()                       # active provider for AI text features
     if category.endswith("News"):
         state = (sel.get("state") or "").strip()
-        city = (st.session_state.get("area_pick_city") or "").strip()
-        # Most specific first, then widen (city → state → resolved place) until we
-        # have enough headlines, so a narrow locality never shows an empty list.
+        district = (st.session_state.get("area_pick_district") or "").strip()
+        # Most specific first, then widen (district → state → resolved place) until
+        # we have enough headlines, so a narrow area never shows an empty list.
         candidates = []
         for cand in (_drill_subject(sel),
-                     ", ".join(p for p in (city, state) if p),
+                     ", ".join(p for p in (district, state) if p),
                      state, place):
             cand = (cand or "").strip()
             if cand and cand not in candidates:
@@ -472,134 +459,110 @@ def _llm_hint() -> str:
     return "a Hugging Face API token" if p == "Hugging Face" else "a Groq API key"
 
 
-def _get_localities(city: str) -> list:
-    """City localities (LLM-generated, cached per city) for the area-news dropdown."""
-    client, mdl = _llm()
-    if not city.strip() or client is None:
-        return []
-    cache = st.session_state.setdefault("localities_cache", {})
-    key = city.strip().lower()
-    if key in cache:
-        return cache[key]
-    locs = list_localities(client, mdl, city)
-    if locs:  # don't cache an empty (possibly transient) result
-        cache[key] = locs
-    return locs
-
-
-def _get_cities(state: str) -> list:
-    """Cities of a state (LLM-generated, cached per state) for the drill-down."""
-    client, mdl = _llm()
-    if not state.strip() or client is None:
-        return []
-    cache = st.session_state.setdefault("cities_cache", {})
-    key = state.strip().lower()
-    if key in cache:
-        return cache[key]
-    locs = list_cities(client, mdl, state)
-    if locs:
-        cache[key] = locs
-    return locs
-
-
 def _drill_subject(sel: dict) -> str:
-    """Full news/topic subject from the State → City → Area picker, e.g.
-    "Bhawarkua, Indore, Madhya Pradesh". Falls back to the searched/selected place
-    when no level has been chosen (or no provider key to list levels)."""
+    """Full news/topic subject from the State → District → Area picker, e.g.
+    "Vijay Nagar, Indore, Madhya Pradesh". Falls back to the searched/selected
+    place when no level has been chosen."""
     state = (sel.get("state") or "").strip()
-    city = (st.session_state.get("area_pick_city") or "").strip()
+    district = (st.session_state.get("area_pick_district") or "").strip()
     area = (st.session_state.get("area_pick_area") or "").strip()
-    parts = [p for p in (area, city, state) if p]
+    parts = [p for p in (area, district, state) if p]
     return ", ".join(parts) if parts else _news_subject(sel)
 
 
 def _drill_place(sel: dict) -> str:
-    """The deepest chosen level's own name (area > city > state), used as the title
-    for topic/overview lookups and the chat heading."""
+    """The deepest chosen level's own name (area > district > state), used as the
+    title for topic/overview lookups and the chat heading."""
     area = (st.session_state.get("area_pick_area") or "").strip()
-    city = (st.session_state.get("area_pick_city") or "").strip()
+    district = (st.session_state.get("area_pick_district") or "").strip()
     state = (sel.get("state") or "").strip()
-    return area or city or state or sel.get("locality") or sel.get("area", "")
+    return area or district or state or sel.get("locality") or sel.get("area", "")
 
 
 def _drill_level_key() -> str:
-    """Cache discriminator for the current drill level (city|area)."""
-    return (f"{st.session_state.get('area_pick_city','')}|"
+    """Cache discriminator for the current drill level (district|area)."""
+    return (f"{st.session_state.get('area_pick_district','')}|"
             f"{st.session_state.get('area_pick_area','')}")
 
 
-def _locate_region(state: str, city: str, area: str) -> dict:
-    """Geocode the deepest non-empty level, widening (area→city→state) until a hit.
-    All queries are scoped to India. Returns {} if nothing resolves."""
-    for parts in ([area, city, state], [city, state], [state]):
+def _locate_region(state: str, district: str, area: str) -> dict:
+    """Offline coordinates for the deepest chosen level, widening (area → district
+    → state) as needed, straight from the bundled PIN-code data. Falls back to a
+    keyless online geocode only if the level isn't in the data. Returns {} if
+    nothing resolves."""
+    coord = geo_data.locate(state, district, area)
+    if coord:
+        return {"lat": coord[0], "lon": coord[1],
+                "area": ", ".join(p for p in (area, district, state) if p),
+                "locality": district or "", "state": state, "detail": "", "address": {}}
+    # Not in the offline data (rare) — try Nominatim (no key) as a last resort.
+    for parts in ([area, district, state], [district, state], [state]):
         if not any(parts):
             continue
-        q = ", ".join([p for p in parts if p] + ["India"])
-        geo = forward_geocode(q)
+        geo = forward_geocode(", ".join([p for p in parts if p] + ["India"]))
         if geo.get("lat") is not None:
             return geo
     return {}
 
 
 def _render_region_cascade() -> None:
-    """Top-of-page State → City → Area picker (India). Selecting any level locates
-    that place, drops the pin, and scopes news/topics to the deepest chosen level.
-    State is a fixed list; City and Area are AI-generated for the level above."""
+    """Top-of-page State → District → Area picker (India), fully offline. Lists and
+    coordinates come from the bundled PIN-code data — no API key, no network needed.
+    Selecting any level locates it, drops the pin, and scopes news/topics to it."""
+    if not geo_data.available():
+        return  # data file missing -> just rely on the search box
+
     sel = st.session_state.get("area_selected") or {}
     applied_state = (sel.get("state") or "").strip()
-    applied_city = (st.session_state.get("area_pick_city") or "").strip()
+    applied_district = (st.session_state.get("area_pick_district") or "").strip()
     applied_area = (st.session_state.get("area_pick_area") or "").strip()
 
-    st.caption("🧭 Or browse India by region — pick a State, then City, then Area.")
+    st.caption("🧭 Or browse India offline — pick a State, then District, then Area.")
     c1, c2, c3 = st.columns(3)
 
-    # Level 1 — State (fixed list).
+    # Level 1 — State.
     with c1:
-        opts = ["— State —"] + INDIA_STATES
+        opts = ["— State —"] + geo_data.list_states()
         idx = opts.index(applied_state) if applied_state in opts else 0
         state_choice = st.selectbox("State", opts, index=idx, key="region_state")
     state = "" if state_choice == "— State —" else state_choice
 
-    # Level 2 — City within the state (AI-generated).
-    cities = _get_cities(state) if state else []
+    # Level 2 — District within the state.
+    districts = geo_data.list_districts(state) if state else []
     with c2:
-        if state and cities:
-            copts = [f"All of {state}"] + cities
-            cidx = copts.index(applied_city) if applied_city in copts else 0
-            city_choice = st.selectbox("City", copts, index=cidx, key=f"region_city_{state}")
-            city = "" if city_choice == f"All of {state}" else city_choice
+        if districts:
+            dopts = [f"All of {state}"] + districts
+            didx = dopts.index(applied_district) if applied_district in dopts else 0
+            d_choice = st.selectbox("District", dopts, index=didx, key=f"region_district_{state}")
+            district = "" if d_choice == f"All of {state}" else d_choice
         else:
-            city = ""
-            st.selectbox("City", ["— pick a state first —"], disabled=True,
-                         key="region_city_disabled")
+            district = ""
+            st.selectbox("District", ["— pick a state first —"], disabled=True,
+                         key="region_district_disabled")
 
-    # Level 3 — Area within the chosen city (AI-generated).
-    localities = _get_localities(city) if city else []
+    # Level 3 — Area within the chosen district.
+    areas = geo_data.list_areas(state, district) if district else []
     with c3:
-        if city and localities:
-            aopts = [f"All of {city}"] + localities
+        if areas:
+            aopts = [f"All of {district}"] + areas
             aidx = aopts.index(applied_area) if applied_area in aopts else 0
-            area_choice = st.selectbox("Area", aopts, index=aidx, key=f"region_area_{city}")
-            area = "" if area_choice == f"All of {city}" else area_choice
+            a_choice = st.selectbox("Area", aopts, index=aidx, key=f"region_area_{district}")
+            area = "" if a_choice == f"All of {district}" else a_choice
         else:
             area = ""
-            st.selectbox("Area", ["— pick a city first —"], disabled=True,
+            st.selectbox("Area", ["— pick a district first —"], disabled=True,
                          key="region_area_disabled")
 
-    if state and not _llm_ready():
-        st.caption(f"💡 Add {_llm_hint()} in the sidebar to list this state's cities & areas.")
-
     # Apply the selection when it differs from what's currently shown on the map.
-    if state and (state, city, area) != (applied_state, applied_city, applied_area):
-        with st.spinner("Locating selection…"):
-            geo = _locate_region(state, city, area)
+    if state and (state, district, area) != (applied_state, applied_district, applied_area):
+        geo = _locate_region(state, district, area)
         if geo.get("lat") is not None:
-            _select_area(geo, news_hint=(area or city or state))
+            _select_area(geo, news_hint=(area or district or state))
             s = st.session_state["area_selected"]
             s["state"] = state                       # keep the chosen level authoritative
-            if city:
-                s["locality"] = city
-            st.session_state["area_pick_city"] = city
+            if district:
+                s["locality"] = district
+            st.session_state["area_pick_district"] = district
             st.session_state["area_pick_area"] = area
             st.rerun()
         else:
@@ -607,13 +570,6 @@ def _render_region_cascade() -> None:
 
 
 def _render_news(data, sel, api_key, model, serper_api_key):
-    if not _llm_ready():
-        st.caption(
-            "Tip: pick a State / City / Area above, or search a specific area "
-            f"(e.g. “Bhawarkua Indore”). Add {_llm_hint()} for AI City/Area lists "
-            "and a concise digest."
-        )
-
     subject = data.get("subject") or _drill_subject(sel) or sel.get("area") or "this area"
     st.subheader(f"📰 News — {subject}")
 
