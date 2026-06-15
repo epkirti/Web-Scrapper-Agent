@@ -6,6 +6,7 @@ streamlit-folium
 folium
 langgraph
 ddgs
+dateparser                 # parse news dates (ISO + "2 days ago") to sort latest-first
 playwright
 beautifulsoup4
 sentence-transformers

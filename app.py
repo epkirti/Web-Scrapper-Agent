@@ -369,8 +369,14 @@ def _get_category_data(category, sel, api_key, model, serper_api_key, news_count
     if category.endswith("News"):
         state = (sel.get("state") or "").strip()
         district = (st.session_state.get("area_pick_district") or "").strip()
-        # Most specific first, then widen (district → state → resolved place) until
-        # we have enough headlines, so a narrow area never shows an empty list.
+        area = (st.session_state.get("area_pick_area") or "").strip()
+        # When a specific Area/District is chosen, fetch ALL of that place's news —
+        # any time (older included), area-only, and more of it — instead of the
+        # sidebar's recency window. State level keeps the chosen recency.
+        specific = bool(area or district)
+        time_filter = "" if specific else news_time
+        fetch_n = max(news_count, 30) if specific else news_count
+
         candidates = []
         for cand in (_drill_subject(sel),
                      ", ".join(p for p in (district, state) if p),
@@ -380,12 +386,15 @@ def _get_category_data(category, sel, api_key, model, serper_api_key, news_count
                 candidates.append(cand)
         subject = candidates[0] if candidates else place
         items = fetch_area_news(subject, serper_api_key=serper_api_key,
-                                max_results=news_count, time_filter=news_time)
+                                max_results=fetch_n, time_filter=time_filter)
+        # Widen only to avoid an empty list: for a specific area keep it area-only
+        # (widen just when nothing was found); otherwise prefer a fuller result.
+        threshold = 1 if specific else 2
         for cand in candidates[1:]:
-            if len(items) >= 2:
+            if len(items) >= threshold:
                 break
             more = fetch_area_news(cand, serper_api_key=serper_api_key,
-                                   max_results=news_count, time_filter=news_time)
+                                   max_results=fetch_n, time_filter=time_filter)
             if len(more) > len(items):
                 items, subject = more, cand
         summary = ""

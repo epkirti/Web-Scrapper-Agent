@@ -11,13 +11,74 @@ Google News endpoint when a key is given, falling back to DuckDuckGo news.
 
 from __future__ import annotations
 
+import datetime as _dt
+import re
 from typing import Optional
 from urllib.parse import quote
 
 import httpx
 from huggingface_hub import InferenceClient
 
+try:  # optional; only used to sort news by date (handles "2 days ago" etc.)
+    import dateparser as _dateparser
+except Exception:  # pragma: no cover - falls back to ISO-only parsing
+    _dateparser = None
+
 _UA = {"User-Agent": "area-explorer/1.0 (research assistant)"}
+
+
+# --------------------------------------------------------------------------- #
+# News date parsing, de-duplication and recency sorting
+# --------------------------------------------------------------------------- #
+def _parse_news_dt(raw: str) -> Optional[_dt.datetime]:
+    """Best-effort parse of a news date into a naive datetime for sorting.
+    Handles ISO 8601 (DuckDuckGo) and relative/absolute text (Serper: "2 days
+    ago", "Jun 10, 2024"). Returns None when it can't be parsed."""
+    s = (raw or "").strip()
+    if not s:
+        return None
+    try:  # fast path: ISO 8601
+        return _dt.datetime.fromisoformat(s.replace("Z", "+00:00")).replace(tzinfo=None)
+    except ValueError:
+        pass
+    if _dateparser is not None:
+        try:
+            dt = _dateparser.parse(s, settings={"RETURN_AS_TIMEZONE_AWARE": False})
+            if dt:
+                return dt.replace(tzinfo=None)
+        except Exception:
+            pass
+    return None
+
+
+def _dedupe_sort_news(items: list[dict]) -> list[dict]:
+    """Drop duplicate stories and order them latest-first.
+
+    Dedup is by URL first, then by a normalized title (case/punctuation-insensitive)
+    so the same story from one source isn't repeated. Each item's ``date`` is
+    rewritten to a tidy "10 Jun 2024" when parseable; undated items sort last."""
+    seen_url, seen_title, out = set(), set(), []
+    for it in items:
+        url = (it.get("url") or "").strip().rstrip("/").lower()
+        norm = re.sub(r"[^a-z0-9]+", " ", (it.get("title") or "").lower()).strip()
+        if (url and url in seen_url) or (norm and norm in seen_title):
+            continue
+        if url:
+            seen_url.add(url)
+        if norm:
+            seen_title.add(norm)
+        dt = _parse_news_dt(it.get("date", ""))
+        new = dict(it)
+        new["_dt"] = dt
+        if dt is not None:
+            new["date"] = dt.strftime("%d %b %Y")
+        out.append(new)
+    # Dated items first (newest → oldest), then undated ones.
+    out.sort(key=lambda x: (x["_dt"] is not None, x["_dt"] or _dt.datetime.min),
+             reverse=True)
+    for it in out:
+        it.pop("_dt", None)
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -510,6 +571,7 @@ def fetch_area_news(
                 for it in items
                 if it.get("title")
             ]
+            out = _dedupe_sort_news(out)
             if out:
                 return out[:max_results]
         except Exception:
@@ -524,7 +586,7 @@ def fetch_area_news(
             kw["timelimit"] = time_filter
         with DDGS() as ddgs:
             results = list(ddgs.news(query, **kw))
-        return [
+        out = _dedupe_sort_news([
             {
                 "title": r.get("title", ""),
                 "url": r.get("url", "") or r.get("href", ""),
@@ -534,7 +596,8 @@ def fetch_area_news(
             }
             for r in results
             if r.get("title")
-        ][:max_results]
+        ])
+        return out[:max_results]
     except Exception:
         return []
 
@@ -615,12 +678,15 @@ def summarize_news(groq_client, model: str, area: str, items: list[dict],
         for it in items
     )
     prompt = (
-        f"You are a news editor. Below are recent headlines about {area} from many "
-        "publications. Write a CONCISE digest (3-5 sentences, or up to 5 short "
-        "bullet points) that consolidates them into one place, so the reader does "
-        "not have to open every article. Lead with the most important development; "
-        "group related items; keep it neutral and factual. Use ONLY these "
-        "headlines — do not invent details.\n"
+        f"You are a news editor. Below are headlines about {area} from many "
+        "publications, already ordered newest-first. Write a CONCISE digest (3-6 "
+        "short bullet points) that consolidates them, so the reader does not have "
+        "to open every article. Rules:\n"
+        "- Each bullet must be a DISTINCT story — never repeat the same development, "
+        "even if several headlines cover it; merge duplicates into one bullet.\n"
+        "- Order bullets from most recent to older; include the date when known.\n"
+        "- Lead with the most important/recent item; keep it neutral and factual.\n"
+        "- Use ONLY these headlines — do not invent details.\n"
         f"Write the digest in {lang}.\n\n"
         f"{lines}\n\nConcise news digest:"
     )
