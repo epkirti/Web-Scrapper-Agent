@@ -449,7 +449,7 @@ def _render_news(data, sel, api_key, model, serper_api_key):
     else:
         # No locality list (no Groq key, or none generated) — guide manual drill-down.
         st.caption("Tip: search a specific area (e.g. “Bhawarkua Indore”) for that locality's news. "
-                   "Add a Groq key to get a one-tap locality picker here.")
+                   "Add a Hugging Face API token to get a one-tap locality picker here.")
 
     subject = data.get("subject") or sel.get("area") or "this area"
     st.subheader(f"📰 News — {subject}")
