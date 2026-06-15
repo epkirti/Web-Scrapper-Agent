@@ -617,7 +617,6 @@ def fetch_area_news(
     time_filter: str = "",
     area_specific: bool = False,
     keep_terms: Optional[list[str]] = None,
-    exclude_terms: Optional[list[str]] = None,
 ) -> list[dict]:
     """Recent news for a place, merged from multiple sources, de-duplicated (by URL
     and title). Each item is ``{title, url, source, date, snippet}``.
@@ -632,10 +631,10 @@ def fetch_area_news(
       the locality's own (often older) stories under recent city-wide ones.
 
     Locality pinning (so "Harsiddhi" doesn't pull in Ujjain/Gujarat temples):
-    ``keep_terms``  — if an item mentions any of these (e.g. the city "Indore") it is
-    always kept. ``exclude_terms`` — an item that mentions any of these *other* places
-    (as whole words) and none of ``keep_terms`` is dropped. Items that name no other
-    place are kept (they're usually about the searched locality).
+    ``keep_terms`` — when given, an item is kept ONLY if its text mentions one of
+    these (the target city/district name or one of its own distinctive localities,
+    supplied by the caller from local gazetteer data). This is generic — it pins
+    results to the searched place without any hand-maintained block list.
 
     ``time_filter`` limits recency: "" (any time), "d" (24h), "w" (week), "m" (month).
     """
@@ -653,20 +652,13 @@ def fetch_area_news(
     items = _dedupe_news(combined, sort=not area_specific)
 
     keep = [t.lower() for t in (keep_terms or []) if t and len(t) > 2]
-    excl = [t for t in (exclude_terms or []) if t and len(t) > 2]
-    if keep or excl:
-        excl_re = (re.compile(r"\b(" + "|".join(re.escape(t) for t in excl) + r")\b", re.I)
-                   if excl else None)
-
-        def _ok(it: dict) -> bool:
-            text = (it.get("title", "") + " " + it.get("snippet", "")).lower()
-            if any(k in text for k in keep):
-                return True                      # mentions the target city -> keep
-            if excl_re and excl_re.search(text):
-                return False                     # names another city/state -> drop
-            return True                          # names no other place -> keep
-
-        items = [it for it in items if _ok(it)]
+    if keep:
+        # Strict: keep only items that mention the target place (its city/district
+        # name or one of its own localities). Anything else is treated as belonging
+        # elsewhere and dropped.
+        items = [it for it in items
+                 if any(k in (it.get("title", "") + " " + it.get("snippet", "")).lower()
+                        for k in keep)]
 
     return items[:max_results]
 

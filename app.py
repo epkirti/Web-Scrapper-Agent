@@ -388,20 +388,13 @@ def _get_category_data(category, sel, api_key, model, serper_api_key, news_count
         subject = candidates[0] if candidates else place
         # The first (most specific) query honours area-specific ranking; widening
         # falls back to broad city/state news (all sources, newest-first). For an
-        # area, keep items that mention the city OR no other place, and drop those
-        # naming a different city/state — so a same-named Harsiddhi temple in
-        # Ujjain/Gujarat is filtered out without losing the city's own un-tagged news.
-        keep_terms, exclude_terms = [], []
-        if area_chosen:
-            for t in (district, sel.get("locality", "")):
-                t = (t or "").strip()
-                if t and t.lower() not in [k.lower() for k in keep_terms]:
-                    keep_terms.append(t)
-            exclude_terms = list(geo_data.competing_places(state, district))
+        # area, pin results to the district: keep only items mentioning the district/
+        # city or one of its own distinct localities (from the offline gazetteer), so
+        # same-named places in other cities (e.g. a Harsiddhi temple in Ujjain) drop.
+        keep_terms = list(geo_data.local_keep_terms(state, district)) if area_chosen else []
         items = fetch_area_news(subject, serper_api_key=serper_api_key,
                                 max_results=fetch_n, time_filter=time_filter,
-                                area_specific=area_chosen,
-                                keep_terms=keep_terms, exclude_terms=exclude_terms)
+                                area_specific=area_chosen, keep_terms=keep_terms)
         threshold = 1 if specific else 2
         for cand in candidates[1:]:
             if len(items) >= threshold:
